@@ -1,0 +1,8 @@
+{
+  "version": "0.2.10",
+  "platform": "darwin",
+  "arch": "arm64",
+  "archive": "wechat-runtime-darwin-arm64.tar.gz",
+  "sha256": "8d4b19aabe53d9135e78e20ff12c365a745db1bff6b0c7a9fdfd0e73e4e17094",
+  "size": 43165714
+}

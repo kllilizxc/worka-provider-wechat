@@ -1,0 +1,1873 @@
+--- a/cmd/wxkey/main.go
++++ b/cmd/wxkey/main.go
+@@ -254,34 +254,14 @@
+ 	logf(f.quiet, "[wxkey] scanning pid=%d root=%s (%d dbs, %d unique salts)\n",
+ 		pid, root, len(dbs), len(saltIdx))
+ 
+-	// Setup uses a two-pass scan: first the fast wrapped SQL literal pattern
+-	// used by wx-cli/wechat-decrypt, then a slower bare-hex fallback within the
+-	// same timeout budget. The standalone scan command keeps --bare-hex explicit
+-	// for diagnostics.
+-	includeBareHex := f.includeBareHex || doSetup
+-	var results map[string]scan.Result
+-	var stats scan.Stats
+-	if doSetup {
+-		results, stats, err = runSetupKeyScan(pid, dbs, saltIdx, setupTimeout(), f.quiet)
+-	} else {
+-		results, stats, err = runKeyScan(pid, dbs, saltIdx, scan.Options{IncludeReadOnlyRegions: true, IncludeSaltNeighborhood: true, IncludeBareHex: includeBareHex}, 0, f.quiet)
+-	}
++	// One structural pass follows live SQLCipher contexts and verifies page HMACs.
++	results, stats, err := runSetupKeyScan(pid, dbs, saltIdx, setupTimeout(), f.quiet)
+ 	if err != nil {
+ 		if errors.Is(err, scan.ErrDeadlineExceeded) && doSetup && len(results) > 0 {
+ 			fmt.Fprintf(os.Stderr, "[wxkey] WARNING: scan timed out after %s; writing partial key coverage (%d/%d). Rerun `wxkey setup` after opening missing chats/pages in WeChat.\n",
+ 				stats.Elapsed.Round(time.Second), len(results), len(saltIdx))
+ 		} else {
+-			// Auto-elevate on permission failure.
+-			if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && os.Geteuid() != 0 {
+-				logf(f.quiet, "[wxkey] task_for_pid denied; requesting macOS administrator authorization...\n")
+-				if reErr := reExecElevated(); reErr != nil {
+-					fail("%s", buildElevateFailHint(reErr, err))
+-				}
+-				return // child handled it
+-			}
+-			if isPermissionErr(err) {
+-				printPermissionAdvice(f.quiet, err)
+-			}
++
+ 			fail("scan: %v", err)
+ 		}
+ 	}
+@@ -296,7 +276,7 @@
+ 		Results: collapseResults(results),
+ 	}
+ 
+-	if doSetup || f.imageKey {
++	if f.imageKey {
+ 		img, err := scanImageKey(pid, root, f.quiet)
+ 		if err != nil {
+ 			out.ImageKeyError = err.Error()
+@@ -323,8 +303,7 @@
+ 		fail("write config: %v", err)
+ 	}
+ 	if len(out.Results) < len(saltIdx) {
+-		fmt.Fprintf(os.Stderr, "[wxkey] WARNING: 部分 key 缺失 (%d/%d). Agent 应继续跑 `wxkey doctor` 轻量定位缺失 DB；只让用户在 WeChat 里打开对应聊天/页面，然后由 agent 重跑 `wxkey setup`。\n",
+-			len(out.Results), len(saltIdx))
++		fmt.Fprintf(os.Stderr, "[wxkey] verified live database coverage: %d/%d\n", len(out.Results), len(saltIdx))
+ 	}
+ 	writeJSON(setupOutput{scanOutput: out, ConfigPath: cfgPath})
+ }
+@@ -388,93 +367,12 @@
+ }
+ 
+ func runSetupKeyScan(pid int, dbs []dbfiles.DB, saltIdx map[string][]int, timeout time.Duration, quiet bool) (map[string]scan.Result, scan.Stats, error) {
+-	start := time.Now()
+ 	deadline := time.Time{}
+ 	if timeout > 0 {
+-		deadline = start.Add(timeout)
+-	}
+-
+-	logf(quiet, "[wxkey] pass 1/5: wrapped SQL literal scan\n")
+-	results, stats, err := runKeyScan(pid, dbs, saltIdx, scan.Options{IncludeReadOnlyRegions: true, Deadline: deadline}, 0, quiet)
+-	if err != nil && !errors.Is(err, scan.ErrDeadlineExceeded) {
+-		return results, stats, err
+-	}
+-	if len(results) == len(saltIdx) || errors.Is(err, scan.ErrDeadlineExceeded) {
+-		return results, stats, err
+-	}
+-
+-	remainingBudget := remainingScanBudget(deadline, start)
+-	if !deadline.IsZero() && remainingBudget <= 0 {
+-		return results, stats, fmt.Errorf("%w after %s", scan.ErrDeadlineExceeded, time.Since(start).Round(time.Second))
+-	}
+-
+-	logf(quiet, "[wxkey] pass 2/5: salt-neighborhood raw-key scan (remaining %s)\n", remainingBudget.Round(time.Second))
+-	saltResults, saltStats, saltErr := runKeyScan(pid, dbs, saltIdx, scan.Options{
+-		IncludeReadOnlyRegions:  true,
+-		IncludeSaltNeighborhood: true,
+-		Deadline:                deadline,
+-	}, stats.Elapsed, quiet)
+-	merged := mergeScanResults(results, saltResults)
+-	cumulativeStats := combineScanStats(stats, saltStats, len(merged), start)
+-	if saltErr != nil && !errors.Is(saltErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, saltErr
+-	}
+-	if len(merged) == len(saltIdx) || errors.Is(saltErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, saltErr
+-	}
+-
+-	remainingBudget = remainingScanBudget(deadline, start)
+-	if !deadline.IsZero() && remainingBudget <= 0 {
+-		return merged, cumulativeStats, fmt.Errorf("%w after %s", scan.ErrDeadlineExceeded, time.Since(start).Round(time.Second))
+-	}
+-
+-	logf(quiet, "[wxkey] pass 3/5: binary-layout strong-pattern scan (remaining %s)\n", remainingBudget.Round(time.Second))
+-	patternResults, patternStats, patternErr := runKeyScan(pid, dbs, saltIdx, scan.Options{
+-		IncludeBinaryPatterns: true,
+-		BinaryPatternMode:     scan.BinaryPatternsStrong,
+-		Deadline:              deadline,
+-	}, cumulativeStats.Elapsed, quiet)
+-	merged = mergeScanResults(merged, patternResults)
+-	cumulativeStats = combineScanStats(cumulativeStats, patternStats, len(merged), start)
+-	if patternErr != nil && !errors.Is(patternErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, patternErr
+-	}
+-	if len(merged) == len(saltIdx) || errors.Is(patternErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, patternErr
+-	}
+-
+-	remainingBudget = remainingScanBudget(deadline, start)
+-	if !deadline.IsZero() {
+-		if remainingBudget <= 0 {
+-			return merged, cumulativeStats, fmt.Errorf("%w after %s", scan.ErrDeadlineExceeded, time.Since(start).Round(time.Second))
+-		}
+-	}
+-	logf(quiet, "[wxkey] pass 4/5: binary-layout zero-run scan (remaining %s)\n", remainingBudget.Round(time.Second))
+-	weakResults, weakStats, weakErr := runKeyScan(pid, dbs, saltIdx, scan.Options{
+-		IncludeBinaryPatterns: true,
+-		BinaryPatternMode:     scan.BinaryPatternsWeak,
+-		Deadline:              deadline,
+-	}, cumulativeStats.Elapsed, quiet)
+-	merged = mergeScanResults(merged, weakResults)
+-	cumulativeStats = combineScanStats(cumulativeStats, weakStats, len(merged), start)
+-	if weakErr != nil && !errors.Is(weakErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, weakErr
+-	}
+-	if len(merged) == len(saltIdx) || errors.Is(weakErr, scan.ErrDeadlineExceeded) {
+-		return merged, cumulativeStats, weakErr
+-	}
+-
+-	remainingBudget = remainingScanBudget(deadline, start)
+-	if !deadline.IsZero() {
+-		if remainingBudget <= 0 {
+-			return merged, cumulativeStats, fmt.Errorf("%w after %s", scan.ErrDeadlineExceeded, time.Since(start).Round(time.Second))
+-		}
+-	}
+-	logf(quiet, "[wxkey] pass 5/5: bare-hex fallback scan (remaining %s)\n", remainingBudget.Round(time.Second))
+-	fallbackResults, fallbackStats, fallbackErr := runKeyScan(pid, dbs, saltIdx, scan.Options{IncludeReadOnlyRegions: true, IncludeBareHex: true, Deadline: deadline}, cumulativeStats.Elapsed, quiet)
+-	merged = mergeScanResults(merged, fallbackResults)
+-	fallbackStats = combineScanStats(cumulativeStats, fallbackStats, len(merged), start)
+-	return merged, fallbackStats, fallbackErr
++		deadline = time.Now().Add(timeout)
++	}
++	logf(quiet, "[wxkey] reading live SQLCipher contexts and verifying database HMACs\n")
++	return runKeyScan(pid, dbs, saltIdx, scan.Options{Deadline: deadline}, 0, quiet)
+ }
+ 
+ func runKeyScan(pid int, dbs []dbfiles.DB, saltIdx map[string][]int, opts scan.Options, elapsedOffset time.Duration, quiet bool) (map[string]scan.Result, scan.Stats, error) {
+@@ -549,16 +447,7 @@
+ 	}
+ 	img, err := scanImageKey(pid, root, f.quiet)
+ 	if err != nil {
+-		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && os.Geteuid() != 0 {
+-			logf(f.quiet, "[wxkey] task_for_pid denied; requesting macOS administrator authorization...\n")
+-			if reErr := reExecElevated(); reErr != nil {
+-				fail("%s", buildElevateFailHint(reErr, err))
+-			}
+-			return
+-		}
+-		if isPermissionErr(err) {
+-			printPermissionAdvice(f.quiet, err)
+-		}
++
+ 		fail("image-key scan: %v", err)
+ 	}
+ 	writeJSON(imageKeyCommandOutput{
+@@ -585,8 +474,8 @@
+ 		printedHeader = true
+ 		fmt.Printf("[OK] key config already exists: %s\n", cfgPath)
+ 		fmt.Printf("     wxid=%s db_root=%s keys=%d\n", cfg.WxID, cfg.DBRoot, len(cfg.Keys))
+-		fmt.Println("     wxkey stores no administrator credential; macOS may show its administrator authentication dialog when refresh needs elevation.")
+-		if configHasImageKey(cfg) {
++		fmt.Println("     wxkey reads only this user's private shadow copy and requests no administrator credential.")
++		if bootstrapCanReuseConfig(cfg, f.imageKey) {
+ 			return
+ 		}
+ 		fmt.Println("[INFO] image_key is missing; continuing bootstrap to refresh image decoding key.")
+@@ -603,7 +492,7 @@
+ 	} else {
+ 		fmt.Println("[INFO] Goal: prepare ~/.config/wxcli/config.json with SIP enabled.")
+ 	}
+-	fmt.Println("[INFO] wxkey does not read or store the administrator password; macOS Authorization Services handles the system prompt when needed.")
++	fmt.Println("[INFO] Reading this user's private debuggable shadow copy without administrator authorization.")
+ 
+ 	if _, err := os.Stat(wechatAppPath); err != nil {
+ 		fail("WeChat app not found at %s: %v", wechatAppPath, err)
+@@ -638,9 +527,11 @@
+ 		}()
+ 	}
+ 
+-	if err := ensureWeChatReady(setupFlags.root, setupFlags.pid, 90*time.Second); err != nil {
++	readyRoot, err := ensureWeChatReady(setupFlags.root, setupFlags.pid, 10*time.Minute)
++	if err != nil {
+ 		fail("%v", err)
+ 	}
++	setupFlags.root = readyRoot
+ 
+ 	if existingReady {
+ 		fmt.Println("[INFO] Extracting image_key and updating config...")
+@@ -676,25 +567,10 @@
+ 		fmt.Printf("[INFO] WeChat version: unknown (%v)\n", strategy.Version.Err)
+ 	}
+ 	fmt.Printf("[INFO] Key strategy: %s (%s)\n", strategy.Name, strategy.Reason)
+-	fmt.Printf("[INFO] Extracting keys and writing config (initial scan timeout %s; PBKDF fallback %s)...\n",
+-		formatDuration(strategy.ScanTimeout), formatDuration(pbkdfProbeTimeout()))
++	fmt.Printf("[INFO] Read-only key scan and config write (timeout %s)...\n", formatDuration(strategy.ScanTimeout))
+ 	res, err := runSetupCaptured(setupFlags, strategy.ScanTimeout)
+ 	if err != nil {
+-		fmt.Fprintf(os.Stderr, "[wxkey] initial passive scan did not capture DB keys before its deadline.\n")
+-		fmt.Fprintf(os.Stderr, "        Trying PBKDF breakpoint fallback for WeChat 4.1.x...\n")
+-		res, err = runPBKDFProbeCaptured(setupFlags, cfgPath)
+-		if err != nil {
+-			fmt.Fprintf(os.Stderr, "        If WeChat just reopened, wait until it is fully logged in, open one chat, then rerun `wxkey bootstrap`.\n")
+-			fail("%v", err)
+-		}
+-	} else if needsPBKDFFallback, reason := bootstrapNeedsPBKDFFallback(res, strategy); needsPBKDFFallback {
+-		fmt.Fprintf(os.Stderr, "[wxkey] initial setup produced partial coverage (%s); trying PBKDF breakpoint fallback...\n", reason)
+-		pbkdfRes, pbkdfErr := runPBKDFProbeCaptured(setupFlags, cfgPath)
+-		if pbkdfErr != nil {
+-			fmt.Fprintf(os.Stderr, "[wxkey] PBKDF fallback skipped after partial setup: %v\n", pbkdfErr)
+-		} else if len(pbkdfRes.Results) > len(res.Results) {
+-			res = pbkdfRes
+-		}
++		fail("read-only key scan: %v", err)
+ 	}
+ 
+ 	fmt.Println("[OK]   key config written")
+@@ -703,7 +579,7 @@
+ 	fmt.Printf("       db_root: %s\n", res.Root)
+ 	fmt.Printf("       keys: %d\n", len(res.Results))
+ 	fmt.Println("")
+-	fmt.Println("Done. Start wechat-cli now; future elevated key refreshes require a new macOS administrator authorization while SIP stays enabled.")
++	fmt.Println("Done. Start wechat-cli now; the original application and system security settings are unchanged.")
+ }
+ 
+ // --- helpers ---
+@@ -975,6 +851,12 @@
+ 	return cfg, cfg.DBRoot != "" && len(cfg.Keys) > 0
+ }
+ 
++// Database readiness is independent of optional image decoding. Explicit
++// image requests still prepare the existing image-key capability when missing.
++func bootstrapCanReuseConfig(cfg wxcliConfig, wantImageKey bool) bool {
++	return cfg.DBRoot != "" && len(cfg.Keys) > 0 && (!wantImageKey || configHasImageKey(cfg))
++}
++
+ func configHasImageKey(cfg wxcliConfig) bool {
+ 	return strings.TrimSpace(cfg.ImageKey) != "" && cfg.ImageXORKey != nil
+ }
+@@ -995,12 +877,33 @@
+ 	return cfg.WxID == wxid && filepath.Clean(cfg.DBRoot) == filepath.Clean(root)
+ }
+ 
++// A host invocation stages keys per attempt but keeps one private app per
++// provider. The only accepted shared path is its exact sibling storage path.
++func shadowStorageRoot(configPath string) (string, error) {
++	root := filepath.Join(filepath.Dir(configPath), "Library", "Application Support", "wx-mcp")
++	if selected := strings.TrimSpace(os.Getenv("WXKEY_SHADOW_WECHAT_APP")); selected != "" {
++		shared := filepath.Join(filepath.Dir(filepath.Dir(configPath)), "Library", "Application Support", "wx-mcp")
++		if selected == filepath.Join(root, "WeChat-shadow.app") {
++			return root, nil
++		}
++		if filepath.Base(filepath.Dir(filepath.Dir(configPath))) != ".wxkey-bootstrap" || selected != filepath.Join(shared, "WeChat-shadow.app") {
++			return "", fmt.Errorf("shadow path does not match private bootstrap storage")
++		}
++		root = shared
++	}
++	return root, nil
++}
++
+ func shadowWeChatPath() string {
+ 	identity, err := invokingIdentity()
+ 	if err != nil {
+ 		return ""
+ 	}
+-	return filepath.Join(filepath.Dir(identity.ConfigPath), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	root, err := shadowStorageRoot(identity.ConfigPath)
++	if err != nil {
++		return ""
++	}
++	return filepath.Join(root, "WeChat-shadow.app")
+ }
+ 
+ func validateShadowWeChatPath(path string) (string, string, string, error) {
+@@ -1011,7 +914,10 @@
+ 	if err != nil {
+ 		return "", "", "", err
+ 	}
+-	rootPath := filepath.Join(filepath.Dir(identity.ConfigPath), "Library", "Application Support", "wx-mcp")
++	rootPath, err := shadowStorageRoot(identity.ConfigPath)
++	if err != nil {
++		return "", "", "", err
++	}
+ 	clean, err := filepath.Abs(filepath.Clean(path))
+ 	if err != nil {
+ 		return "", "", "", err
+@@ -1162,18 +1068,37 @@
+ 	return nil
+ }
+ 
++// Launch Services can return an error while the app it started is waiting on
++// a system permission. The verified process, not open's exit code, determines
++// whether startup succeeded; login readiness is checked separately afterward.
++func launchAndConfirmShadow(launch func() error, confirm func() (int, error)) (int, error) {
++	launchErr := launch()
++	pid, err := confirm()
++	if err != nil {
++		return 0, errors.Join(launchErr, err)
++	}
++	return pid, nil
++}
++
+ func prepareShadowWeChat() (int, func(), error) {
+ 	shadowPath, stoppedOriginal, err := prepareShadowWeChatCopy()
+ 	if err != nil {
+ 		return 0, nil, err
+ 	}
+ 
++	// A prior attempt may be waiting for login or a system permission. Reuse
++	// that exact verified process without launching another app instance.
++	if processes, _, err := invokerWechatProcesses(); err != nil {
++		return 0, nil, err
++	} else if len(processes) == 1 && processes[0].Path == expectedWechatExecutable(shadowPath) {
++		return processes[0].PID, nil, nil
++	}
++
+ 	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
+-	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
+-		reopenOriginalWeChatIf(stoppedOriginal)
+-		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
+-	}
+-	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
++	pid, err := launchAndConfirmShadow(
++		func() error { return exec.Command("/usr/bin/open", "-n", shadowPath).Run() },
++		func() (int, error) { return waitForWeChatPIDUnderApp(shadowPath, 90*time.Second) },
++	)
+ 	if err != nil {
+ 		reopenOriginalWeChatIf(stoppedOriginal)
+ 		return 0, nil, err
+@@ -1220,6 +1145,37 @@
+ 		reopenOriginalWeChatIf(stoppedOriginal)
+ 	}
+ 	return pid, registerFailureCleanup(cleanup), nil
++}
++
++func verifyReusableShadow(path string) error {
++	_, rootPath, name, err := validateShadowWeChatPath(path)
++	if err != nil {
++		return err
++	}
++	root, err := openManagedShadowRoot(rootPath)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	info, err := root.Lstat(name)
++	if err != nil {
++		return err
++	}
++	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
++		return fmt.Errorf("private shadow is not a directory")
++	}
++	original, shadow := detectWeChatVersion(wechatAppPath), detectWeChatVersion(path)
++	if original.Err != nil || shadow.Err != nil || original.ShortVersion != shadow.ShortVersion || original.Build != shadow.Build {
++		return fmt.Errorf("private shadow version differs from installed WeChat; replace it after closing the private app")
++	}
++	sig := inspectAppSignature(path)
++	if sig.Err != nil || !sig.AdHoc {
++		return fmt.Errorf("private shadow signature is invalid")
++	}
++	if err := exec.Command("/usr/bin/codesign", "--verify", "--deep", path).Run(); err != nil {
++		return fmt.Errorf("verify private shadow: %w", err)
++	}
++	return nil
+ }
+ 
+ func prepareShadowWeChatCopy() (string, bool, error) {
+@@ -1244,12 +1200,25 @@
+ 			}
+ 			stoppedOriginal = true
+ 		case expectedWechatExecutable(shadowPath):
+-			return "", false, fmt.Errorf("this user's shadow WeChat is already running; close it before preparing a new copy")
++			if err := verifyReusableShadow(shadowPath); err != nil {
++				return "", false, err
++			}
++			return shadowPath, false, nil
+ 		default:
+ 			return "", false, fmt.Errorf("this user's WeChat process has an unexpected path; refusing to prepare a shadow copy")
+ 		}
+ 	}
+ 
++	if _, err := os.Lstat(shadowPath); err == nil {
++		if err := verifyReusableShadow(shadowPath); err != nil {
++			reopenOriginalWeChatIf(stoppedOriginal)
++			return "", false, err
++		}
++		return shadowPath, stoppedOriginal, nil
++	} else if !errors.Is(err, os.ErrNotExist) {
++		reopenOriginalWeChatIf(stoppedOriginal)
++		return "", false, err
++	}
+ 	fmt.Println("[INFO] Preparing wechat-cli WeChat shadow copy...")
+ 	if err := safeRemoveShadowWeChat(shadowPath); err != nil {
+ 		reopenOriginalWeChatIf(stoppedOriginal)
+@@ -1259,8 +1228,8 @@
+ 		if out, err := combinedOutputAsInvokingUser("/bin/cp", "-R", wechatAppPath, stagedPath); err != nil {
+ 			return fmt.Errorf("copy WeChat to staged shadow path: %w\n%s", err, strings.TrimSpace(string(out)))
+ 		}
+-		if out, err := combinedOutputAsInvokingUser("/usr/bin/codesign", "--force", "--deep", "--sign", "-", stagedPath); err != nil {
+-			return fmt.Errorf("codesign staged shadow WeChat failed: %w\n%s", err, strings.TrimSpace(string(out)))
++		if err := signShadowForReadAccess(stagedPath); err != nil {
++			return err
+ 		}
+ 		sig := inspectAppSignature(stagedPath)
+ 		if sig.Err != nil {
+@@ -1275,6 +1244,23 @@
+ 		return "", false, err
+ 	}
+ 	return shadowPath, stoppedOriginal, nil
++}
++
++func signShadowForReadAccess(stagedPath string) error {
++	if out, err := combinedOutputAsInvokingUser("/usr/bin/codesign", "--force", "--deep", "--sign", "-", stagedPath); err != nil {
++		return fmt.Errorf("codesign staged shadow WeChat failed: %w\n%s", err, strings.TrimSpace(string(out)))
++	}
++	// Only this private copy's main executable opts in to debugging. Nested
++	// helpers retain the ordinary ad-hoc signature created above.
++	entitlementsPath := filepath.Join(filepath.Dir(stagedPath), "shadow.entitlements.plist")
++	const entitlements = `<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>`
++	if err := os.WriteFile(entitlementsPath, []byte(entitlements), 0o644); err != nil {
++		return fmt.Errorf("write shadow debug entitlements: %w", err)
++	}
++	if out, err := combinedOutputAsInvokingUser("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", entitlementsPath, stagedPath); err != nil {
++		return fmt.Errorf("sign private shadow for read access: %w\n%s", err, strings.TrimSpace(string(out)))
++	}
++	return nil
+ }
+ 
+ func reopenOriginalWeChatIf(stoppedOriginal bool) {
+@@ -1321,41 +1307,37 @@
+ 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+ }
+ 
+-func ensureWeChatReady(root string, pid int, timeout time.Duration) error {
++func ensureWeChatReady(root string, pid int, timeout time.Duration) (string, error) {
+ 	deadline := time.Now().Add(timeout)
+ 	if pid == 0 {
+ 		processes, _, err := invokerWechatProcesses()
+ 		if err != nil {
+-			return err
++			return "", err
+ 		}
+ 		if len(processes) == 0 {
+ 			fmt.Println("[INFO] Opening WeChat...")
+ 			if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
+-				return fmt.Errorf("open WeChat for this user: %w", err)
++				return "", fmt.Errorf("open WeChat for this user: %w", err)
+ 			}
+ 		}
+ 	} else if !verifiedWechatProcessInSnapshotFromPID(pid) {
+-		fmt.Println("[INFO] Opening WeChat...")
+-		return fmt.Errorf("WeChat PID %d is no longer verified for the invoking UID; refusing to open another instance", pid)
+-	}
++		return "", fmt.Errorf("WeChat PID %d is no longer verified for the invoking UID", pid)
++	}
++	fmt.Println("[INFO] Waiting for WeChat login and an actually opened account database...")
+ 	for {
+-		readyPID := false
+-		if pid > 0 {
+-			readyPID = verifiedWechatProcessInSnapshotFromPID(pid)
+-		} else if _, err := pickWeChatPID(); err == nil {
+-			readyPID = true
+-		}
+-		if readyPID {
+-			if root != "" {
+-				if st, statErr := os.Stat(root); statErr == nil && st.IsDir() {
+-					return nil
++		currentPID := pid
++		if currentPID == 0 {
++			currentPID, _ = pickWeChatPID()
++		}
++		if currentPID > 0 && verifiedWechatProcessInSnapshotFromPID(currentPID) {
++			if opened, err := openedAccountRoot(currentPID, effectiveUserHome()); err == nil {
++				if root == "" || filepath.Clean(root) == opened {
++					return opened, nil
+ 				}
+-			} else if _, err := pickAccountRoot(); err == nil {
+-				return nil
+ 			}
+ 		}
+ 		if time.Now().After(deadline) {
+-			return fmt.Errorf("WeChat is not ready yet; open WeChat, finish login, open one chat, then rerun `wxkey bootstrap`")
++			return "", fmt.Errorf("WeChat has not opened the selected account database; finish login in WeChat and open one chat, then retry initialization")
+ 		}
+ 		time.Sleep(2 * time.Second)
+ 	}
+@@ -1375,37 +1357,28 @@
+ 
+ func selectBootstrapKeyStrategy(appPath string) bootstrapKeyStrategy {
+ 	version := detectWeChatVersion(appPath)
+-	pbkdfPreferred := version.Parsed && versionAtLeast(version.Parts, 4, 1, 10)
+ 	if d, ok := durationEnv("WXKEY_BOOTSTRAP_SCAN_TIMEOUT"); ok {
+ 		return bootstrapKeyStrategy{
+-			Name:           "env-override",
+-			Reason:         "WXKEY_BOOTSTRAP_SCAN_TIMEOUT was set",
+-			ScanTimeout:    d,
+-			PBKDFPreferred: pbkdfPreferred,
+-			Version:        version,
++			Name:        "env-override",
++			Reason:      "WXKEY_BOOTSTRAP_SCAN_TIMEOUT was set",
++			ScanTimeout: d,
++			Version:     version,
+ 		}
+ 	}
+ 	if d, name, ok := firstDurationEnv("WXKEY_SETUP_TIMEOUT", "WXKEY_SCAN_TIMEOUT"); ok {
+ 		return bootstrapKeyStrategy{
+-			Name:           "env-override",
+-			Reason:         name + " was set",
+-			ScanTimeout:    d,
+-			PBKDFPreferred: pbkdfPreferred,
+-			Version:        version,
++			Name:        "env-override",
++			Reason:      name + " was set",
++			ScanTimeout: d,
++			Version:     version,
+ 		}
+ 	}
+ 
+ 	strategy := bootstrapKeyStrategy{
+-		Name:        "passive-scan",
+-		Reason:      "default compatibility path for versions where passive memory scan may still expose DB keys",
++		Name:        "codec-context",
++		Reason:      "read-only SQLCipher context verification in this user's private shadow copy",
+ 		ScanTimeout: defaultSetupTimeout,
+ 		Version:     version,
+-	}
+-	if pbkdfPreferred {
+-		strategy.Name = "pbkdf-early"
+-		strategy.Reason = "WeChat 4.1.10+ is better served by a short passive probe followed by PBKDF breakpoint capture"
+-		strategy.ScanTimeout = pbkdfEarlyBootstrapScanTimeout
+-		strategy.PBKDFPreferred = true
+ 	}
+ 	return strategy
+ }
+@@ -1486,11 +1459,9 @@
+ 	return d.Round(time.Second).String()
+ }
+ 
+-func runSetupCaptured(f scanFlags, timeout time.Duration) (*setupOutput, error) {
+-	exe, err := os.Executable()
+-	if err != nil {
+-		return nil, err
+-	}
++// Keep the child setup protocol explicit: text setup is the default, and
++// optional image preparation is forwarded only when the caller requested it.
++func setupCommandArgs(exe string, f scanFlags) []string {
+ 	args := []string{exe, "setup"}
+ 	if f.pid > 0 {
+ 		args = append(args, "--pid", strconv.Itoa(f.pid))
+@@ -1501,6 +1472,18 @@
+ 	if f.config != "" {
+ 		args = append(args, "--config", f.config)
+ 	}
++	if f.imageKey {
++		args = append(args, "--image-key")
++	}
++	return args
++}
++
++func runSetupCaptured(f scanFlags, timeout time.Duration) (*setupOutput, error) {
++	exe, err := os.Executable()
++	if err != nil {
++		return nil, err
++	}
++	args := setupCommandArgs(exe, f)
+ 	commandTimeout := time.Duration(0)
+ 	if timeout > 0 {
+ 		args = append([]string{"WXKEY_SETUP_TIMEOUT=" + timeout.String()}, args...)
+@@ -2288,9 +2271,8 @@
+ 		}
+ 		last = time.Now()
+ 		s.Elapsed += elapsedOffset
+-		fmt.Fprintf(os.Stderr, "[wxkey] scanned %.0f MB / %d regions, %d wrapped + %d salt + %d binary + %d bare hits, %d candidate_checks, found=%d\n",
+-			float64(s.BytesScanned)/1024/1024, s.Regions, s.HexMatches, s.SaltMatches, s.BinaryPatternMatches,
+-			s.BareHexMatches, s.Verifications, s.Found)
++		fmt.Fprintf(os.Stderr, "[wxkey] scanned %.0f MB / %d regions, %d codec candidates, %d HMAC-verified contexts, %d read failures, found=%d\n",
++			float64(s.BytesScanned)/1024/1024, s.Regions, s.CodecCandidates, s.VerifiedContexts, s.ReadFailures, s.Found)
+ 	}
+ }
+ 
+--- a/cmd/wxkey/process_scope.go
++++ b/cmd/wxkey/process_scope.go
+@@ -427,7 +427,10 @@
+ 			if !pidAlive(process.PID) {
+ 				return nil
+ 			}
+-			return fmt.Errorf("cannot verify WeChat PID %d while waiting for exit: %w", process.PID, err)
++			// Exit can make libproc metadata disappear before kill(0) stops
++			// seeing the PID. Waiting is passive; never signal an unknown PID.
++			time.Sleep(200 * time.Millisecond)
++			continue
+ 		}
+ 		identity, idErr := invokingIdentity()
+ 		if idErr != nil {
+--- a/internal/machvm/machvm.go
++++ b/internal/machvm/machvm.go
+@@ -1,10 +1,8 @@
+ // Package machvm wraps the Mach VM syscalls used to enumerate and read another
+ // process's memory on macOS. Implemented via purego (no cgo).
+ //
+-// task_for_pid is gated by macOS taskgated/kernel policy: the caller needs a
+-// debuggable target process plus sufficient caller privilege. wxkey's supported
+-// WeChat route is ad-hoc-signing WeChat.app and running wxkey with admin
+-// privileges while SIP stays enabled.
++// Only a read task port is requested. The invoking user's isolated shadow
++// opts in to debugging; the original application and system policy are unchanged.
+ package machvm
+ 
+ import (
+@@ -32,7 +30,7 @@
+ 	loaded bool
+ 
+ 	machTaskSelf        func() uint32
+-	taskForPid          func(task uint32, pid int32, targetTask *uint32) int32
++	taskReadForPid      func(task uint32, pid int32, targetTask *uint32) int32
+ 	machVmRegion        func(task uint32, addr *uint64, size *uint64, flavor int32, info unsafe.Pointer, count *uint32, objectName *uint32) int32
+ 	machVmReadOverwrite func(task uint32, addr uint64, size uint64, data unsafe.Pointer, outSize *uint64) int32
+ 	machPortDeallocate  func(task uint32, port uint32) int32
+@@ -49,7 +47,7 @@
+ 		return fmt.Errorf("dlopen libSystem: %w", err)
+ 	}
+ 	purego.RegisterLibFunc(&machTaskSelf, h, "mach_task_self")
+-	purego.RegisterLibFunc(&taskForPid, h, "task_for_pid")
++	purego.RegisterLibFunc(&taskReadForPid, h, "task_read_for_pid")
+ 	purego.RegisterLibFunc(&machVmRegion, h, "mach_vm_region")
+ 	purego.RegisterLibFunc(&machVmReadOverwrite, h, "mach_vm_read_overwrite")
+ 	purego.RegisterLibFunc(&machPortDeallocate, h, "mach_port_deallocate")
+@@ -79,17 +77,16 @@
+ // PID returns the underlying process id.
+ func (p *Process) PID() int32 { return p.pid }
+ 
+-// Attach acquires the Mach task port for pid. Returns a wrapped error
+-// describing the kr code on failure (most commonly KERN_FAILURE = 5 = "not
+-// permitted"; KERN_INVALID_ARGUMENT = 4 = "no such process").
++// Attach acquires only the read task port for pid and reports the OS result.
++// The target must opt in to access; this function never requests elevation.
+ func Attach(pid int32) (*Process, error) {
+ 	if err := ensureLoaded(); err != nil {
+ 		return nil, err
+ 	}
+ 	self := machTaskSelf()
+ 	var task uint32
+-	if kr := taskForPid(self, pid, &task); kr != KERN_SUCCESS {
+-		return nil, fmt.Errorf("task_for_pid pid=%d kr=%d (need admin privileges plus ad-hoc-signed WeChat; run wxkey bootstrap and keep SIP enabled)", pid, kr)
++	if result := taskReadForPid(self, pid, &task); result != 0 {
++		return nil, fmt.Errorf("task_read_for_pid pid=%d result=%d (target must permit read access for this user)", pid, result)
+ 	}
+ 	return &Process{pid: pid, task: task, self: self}, nil
+ }
+--- /dev/null
++++ b/cmd/wxkey/readonly_shadow_test.go
+@@ -0,0 +1,107 @@
++package main
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/r266-tech/wxkey/internal/machvm"
++)
++
++// This exercises the real shadow signing function and the actual purego read
++// bindings across different executables. It never starts or reads WeChat.
++func TestReadOnlyPrivateShadowWithoutAdministrator(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("must exercise an ordinary user")
++	}
++	root := t.TempDir()
++	app := filepath.Join(root, "ReadOnlyProbe.app")
++	executable := filepath.Join(app, "Contents", "MacOS", "ReadOnlyProbe")
++	if err := os.MkdirAll(filepath.Dir(executable), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	info := `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>ReadOnlyProbe</string><key>CFBundleIdentifier</key><string>org.worka.readonly-probe</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>`
++	if err := os.WriteFile(filepath.Join(app, "Contents", "Info.plist"), []byte(info), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	source := filepath.Join(root, "probe.c")
++	program := `#include <stdint.h>
++#include <stdio.h>
++#include <unistd.h>
++static const char marker[] = "Worka public cross-executable test";
++int main(void) {
++    printf("%u %llu\n", getuid(), (unsigned long long)(uintptr_t)marker);
++    fflush(stdout);
++    getchar();
++    return 0;
++}`
++	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	if out, err := exec.CommandContext(ctx, "/usr/bin/clang", "-O0", source, "-o", executable).CombinedOutput(); err != nil {
++		t.Fatalf("compile synthetic child: %v/%s", err, out)
++	}
++	if err := signShadowForReadAccess(app); err != nil {
++		t.Fatal(err)
++	}
++	if out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "--verify", "--deep", "--strict", app).CombinedOutput(); err != nil {
++		t.Fatalf("verify synthetic signature: %v/%s", err, out)
++	}
++	child := exec.CommandContext(ctx, executable)
++	output, err := child.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	input, err := child.StdinPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := child.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = input.Close(); _ = child.Wait() }()
++	line, err := bufio.NewReader(output).ReadString('\n')
++	if err != nil {
++		t.Fatalf("synthetic child startup: %v", err)
++	}
++	fields := strings.Fields(line)
++	if len(fields) != 2 {
++		t.Fatalf("invalid synthetic child handshake")
++	}
++	uid, err := strconv.Atoi(fields[0])
++	if err != nil || uid != os.Getuid() {
++		t.Fatalf("child not running as invoking user")
++	}
++	address, err := strconv.ParseUint(fields[1], 10, 64)
++	if err != nil {
++		t.Fatal(err)
++	}
++	process, err := machvm.Attach(int32(child.Process.Pid))
++	if err != nil {
++		t.Fatalf("read task port: %v", err)
++	}
++	defer process.Detach()
++	expected := "Worka public cross-executable test"
++	observed := make([]byte, len(expected))
++	n, err := process.Read(address, observed)
++	if err != nil || n != len(expected) || string(observed) != expected {
++		t.Fatalf("public synthetic read mismatch: bytes=%d err=%v", n, err)
++	}
++	regions := 0
++	if err := process.Regions(func(_ machvm.Region) bool { regions++; return regions < 3 }); err != nil {
++		t.Fatal(err)
++	}
++	if regions == 0 {
++		t.Fatal("read port could not enumerate any regions")
++	}
++	t.Log(fmt.Sprintf("ordinary uid=%d; cross-executable read and region enumeration passed", uid))
++}
+--- /dev/null
++++ b/cmd/wxkey/readonly_exit_test.go
+@@ -0,0 +1,46 @@
++package main
++
++import (
++	"os/exec"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++func TestExitWaitToleratesDisappearingMetadataWithoutSignalling(t *testing.T) {
++	loadProcInfoFunctions()
++	if procInfoErr != nil {
++		t.Fatal(procInfoErr)
++	}
++	original := procPIDInfo
++	procPIDInfo = func(int32, int32, uint64, unsafe.Pointer, int32) int32 { return 0 }
++	defer func() { procPIDInfo = original }()
++
++	t.Run("reaped child is a completed exit", func(t *testing.T) {
++		child := exec.Command("/bin/sleep", "10")
++		if err := child.Start(); err != nil {
++			t.Fatal(err)
++		}
++		done := make(chan struct{})
++		go func() { time.Sleep(100 * time.Millisecond); _ = child.Process.Kill(); _ = child.Wait(); close(done) }()
++		defer func() { <-done }()
++		err := waitForWechatExit(wechatProcess{PID: child.Process.Pid}, "/unused.app", 2*time.Second)
++		if err != nil {
++			t.Fatalf("exit race rejected: %v", err)
++		}
++	})
++	t.Run("unknown live child remains alive", func(t *testing.T) {
++		child := exec.Command("/bin/sleep", "10")
++		if err := child.Start(); err != nil {
++			t.Fatal(err)
++		}
++		defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
++		err := waitForWechatExit(wechatProcess{PID: child.Process.Pid}, "/unused.app", 50*time.Millisecond)
++		if err == nil {
++			t.Fatal("unknown live process was accepted as exited")
++		}
++		if !pidAlive(child.Process.Pid) {
++			t.Fatal("passive wait killed an unknown process")
++		}
++	})
++}
+--- /dev/null
++++ b/cmd/wxkey/logged_in_root.go
+@@ -0,0 +1,50 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// A saved account directory does not prove that this WeChat process is logged
++// in. Select only the database root actually opened by the verified process.
++func openedAccountRoot(pid int, home string) (string, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	out, err := exec.CommandContext(ctx, "/usr/sbin/lsof", "-a", "-p", strconv.Itoa(pid), "-Fn").Output()
++	if err != nil {
++		return "", fmt.Errorf("inspect opened WeChat database: %w", err)
++	}
++	return accountRootFromOpenFiles(string(out), home)
++}
++
++func accountRootFromOpenFiles(output, home string) (string, error) {
++	container := filepath.Join(home, "Library", "Containers", "com.tencent.xinWeChat", "Data")
++	roots := map[string]bool{}
++	for _, line := range strings.Split(output, "\n") {
++		if !strings.HasPrefix(line, "n/") {
++			continue
++		}
++		root, suffix, found := strings.Cut(line[1:], "/db_storage/")
++		if !found || suffix == "" {
++			continue
++		}
++		root = filepath.Clean(root)
++		rel, err := filepath.Rel(container, root)
++		if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
++			continue
++		}
++		roots[root] = true
++	}
++	if len(roots) != 1 {
++		return "", fmt.Errorf("expected one opened account database root, found %d", len(roots))
++	}
++	for root := range roots {
++		return root, nil
++	}
++	panic("unreachable")
++}
+--- /dev/null
++++ b/cmd/wxkey/logged_in_root_test.go
+@@ -0,0 +1,34 @@
++package main
++
++import (
++	"path/filepath"
++	"testing"
++)
++
++func TestAccountRootUsesOpenedDatabaseInsteadOfSavedDirectory(t *testing.T) {
++	home := "/Users/public-fixture"
++	base := filepath.Join(home, "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
++	active := filepath.Join(base, "active")
++	other := filepath.Join(base, "other")
++	for _, tc := range []struct {
++		name, output string
++		valid        bool
++	}{
++		{"login window without database", "p42\nn/Applications/WeChat.app/Contents/MacOS/WeChat\n", false},
++		{"one active account, multiple database files", "n" + active + "/db_storage/contact/contact.db\nn" + active + "/db_storage/message/message_0.db-wal\n", true},
++		{"multiple account roots are ambiguous", "n" + active + "/db_storage/contact/contact.db\nn" + other + "/db_storage/contact/contact.db\n", false},
++		{"another home cannot be selected", "n/Users/another/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/account/db_storage/contact/contact.db\n", false},
++		{"path traversal cannot escape container", "n" + active + "/../../../../../../outside/db_storage/contact.db\n", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := accountRootFromOpenFiles(tc.output, home)
++			if tc.valid {
++				if err != nil || got != active {
++					t.Fatalf("active root not selected: %q/%v", got, err)
++				}
++			} else if err == nil {
++				t.Fatal("unready or ambiguous account was accepted")
++			}
++		})
++	}
++}
+--- a/internal/scan/scan.go
++++ b/internal/scan/scan.go
+@@ -1,17 +1,6 @@
+-// Package scan finds WeChat database master keys by walking the WeChat
+-// process's RW memory regions, looking for the SQL literal pattern
+-// `x'<hex>'` that older WCDB builds used when forwarding keys to
+-// sqlite3_key_v2, plus optional binary layout patterns seen in newer WeChat
+-// 4.x heaps, and verifying each candidate against page 1 of every collected DB.
+-//
+-// Algorithm (after Thearas, adapted for SQLCipher 4 + WCDB v4 KDF):
+-//  1. enumerate RW non-executable regions of the WeChat task
+-//  2. read each region in chunks; regex-match `x'[0-9a-fA-F]{64,192}'`
+-//  3. for each match, take first 64 hex as candidate key, last 32 hex
+-//     (when present) as embedded salt
+-//  4. if embedded salt matches a DB salt, verify against that DB only;
+-//     otherwise, try every DB whose salt is still unmatched
+-//  5. verification = SQLCipher 4 password-or-enc_key MAC check
++// Package scan reads SQLCipher codec structures and validates their derived
++// keys against database page HMACs. Keys and salts are separate allocations;
++// no nearby-byte, password-pattern or repeated scan fallback is used.
+ package scan
+ 
+ import (
+@@ -29,7 +18,6 @@
+ 	"time"
+ 
+ 	"github.com/r266-tech/wxkey/internal/dbfiles"
+-	"github.com/r266-tech/wxkey/internal/machvm"
+ 	"github.com/r266-tech/wxkey/internal/verify"
+ )
+ 
+@@ -106,6 +94,9 @@
+ 
+ // Stats summarizes a scan run.
+ type Stats struct {
++	CodecCandidates      int           `json:"codec_candidates,omitempty"`
++	VerifiedContexts     int           `json:"verified_contexts,omitempty"`
++	ReadFailures         int           `json:"read_failures,omitempty"`
+ 	Regions              int           `json:"regions"`
+ 	PriorityRegions      int           `json:"priority_regions,omitempty"`
+ 	BytesScanned         uint64        `json:"bytes_scanned"`
+@@ -178,159 +169,7 @@
+ 
+ // RunWithOptions is Run with explicit options.
+ func RunWithOptions(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts Options, progress ProgressFn) (map[string]Result, Stats, error) {
+-	start := time.Now()
+-	var stats Stats
+-	finish := func(results map[string]Result, err error) (map[string]Result, Stats, error) {
+-		stats.Found = len(results)
+-		stats.Elapsed = time.Since(start)
+-		return results, stats, err
+-	}
+-	deadlineExceeded := func() bool {
+-		return !opts.Deadline.IsZero() && time.Now().After(opts.Deadline)
+-	}
+-
+-	if len(dbs) == 0 {
+-		return nil, stats, fmt.Errorf("scan.Run: no DBs to verify against")
+-	}
+-
+-	proc, err := machvm.Attach(pid)
+-	if err != nil {
+-		return nil, stats, err
+-	}
+-	defer proc.Detach()
+-
+-	// Track which salts (and therefore which DBs) we've already cracked.
+-	results := map[string]Result{} // keyed by salt-hex
+-	remaining := map[string]struct{}{}
+-	for s := range saltIdx {
+-		remaining[s] = struct{}{}
+-	}
+-
+-	// Collect RW non-executable regions first (so we can report total bytes).
+-	var regions []memRegion
+-	err = proc.Regions(func(r machvm.Region) bool {
+-		if !r.IsReadable() || r.IsExecutable() {
+-			return true
+-		}
+-		if !opts.IncludeReadOnlyRegions && !r.IsWritable() {
+-			return true
+-		}
+-		if r.Size == 0 || r.Size > MaxRegionSize {
+-			return true
+-		}
+-		regions = append(regions, memRegion{r.Address, r.Size})
+-		return true
+-	})
+-	if err != nil {
+-		return nil, stats, fmt.Errorf("enumerate regions: %w", err)
+-	}
+-	if opts.IncludeBinaryPatterns {
+-		regions, stats.PriorityRegions = prioritizeMallocRegions(pid, regions)
+-	}
+-	stats.Regions = len(regions)
+-
+-	chunk := make([]byte, chunkSize+overlap)
+-	var carry []byte // overlap bytes from prior chunk
+-	seenBinaryCandidates := map[string]struct{}{}
+-	seenSaltNeighborhoodCandidates := map[string]struct{}{}
+-	passwordAnchors := preferredPasswordDBIndices(dbs)
+-
+-	for _, r := range regions {
+-		if len(remaining) == 0 {
+-			break
+-		}
+-		off := uint64(0)
+-		carry = carry[:0]
+-
+-		for off < r.size {
+-			n := uint64(chunkSize)
+-			if n > r.size-off {
+-				n = r.size - off
+-			}
+-			// Place fresh data after carry.
+-			if len(carry) > 0 {
+-				copy(chunk, carry)
+-			}
+-			read, rerr := proc.Read(r.addr+off, chunk[len(carry):len(carry)+int(n)])
+-			if rerr != nil || read == 0 {
+-				off += n
+-				carry = carry[:0]
+-				continue
+-			}
+-			view := chunk[:len(carry)+read]
+-			viewAddr := r.addr + off - uint64(len(carry))
+-			stats.BytesScanned += uint64(read)
+-
+-			matches := hexLitRe.FindAllSubmatchIndex(view, -1)
+-			for _, m := range matches {
+-				if deadlineExceeded() {
+-					return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+-				}
+-				stats.HexMatches++
+-				hex := view[m[2]:m[3]]
+-				if processed := tryCandidate(hex, dbs, saltIdx, remaining, results, &stats); processed {
+-					if len(remaining) == 0 {
+-						break
+-					}
+-				}
+-			}
+-
+-			if opts.IncludeBinaryPatterns && len(remaining) > 0 {
+-				tryBinaryPatternCandidates(viewAddr, view, dbs, saltIdx, remaining, results, &stats,
+-					seenBinaryCandidates, passwordAnchors, opts.BinaryPatternMode, deadlineExceeded)
+-				if deadlineExceeded() {
+-					return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+-				}
+-			}
+-
+-			if opts.IncludeSaltNeighborhood && len(remaining) > 0 {
+-				trySaltNeighborhoodCandidates(view, dbs, saltIdx, remaining, results, &stats,
+-					seenSaltNeighborhoodCandidates, deadlineExceeded)
+-				if deadlineExceeded() {
+-					return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+-				}
+-			}
+-
+-			if opts.IncludeBareHex && len(remaining) > 0 {
+-				bare := bareHexRe.FindAllSubmatchIndex(view, -1)
+-				for _, m := range bare {
+-					if deadlineExceeded() {
+-						return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+-					}
+-					stats.BareHexMatches++
+-					hex := view[m[2]:m[3]]
+-					if processed := tryCandidate(hex, dbs, saltIdx, remaining, results, &stats); processed {
+-						if len(remaining) == 0 {
+-							break
+-						}
+-					}
+-				}
+-			}
+-
+-			// Save tail as carry for next chunk so we don't miss a literal
+-			// that straddles the boundary.
+-			if read > overlap {
+-				carry = append(carry[:0], view[len(view)-overlap:]...)
+-			} else {
+-				carry = append(carry[:0], view...)
+-			}
+-			off += n
+-
+-			if progress != nil {
+-				stats.Elapsed = time.Since(start)
+-				progress(stats)
+-			}
+-
+-			if deadlineExceeded() {
+-				return finish(results, fmt.Errorf("%w after %s", ErrDeadlineExceeded, time.Since(start).Round(time.Second)))
+-			}
+-			if len(remaining) == 0 {
+-				break
+-			}
+-		}
+-	}
+-
+-	return finish(results, nil)
++	return runCodecContextScan(pid, dbs, saltIdx, opts, progress)
+ }
+ 
+ func tryBinaryPatternCandidates(viewAddr uint64, view []byte, dbs []dbfiles.DB, saltIdx map[string][]int,
+--- /dev/null
++++ b/internal/scan/codec_context.go
+@@ -0,0 +1,240 @@
++package scan
++
++import (
++	"bytes"
++	"crypto/hmac"
++	"crypto/pbkdf2"
++	"crypto/sha512"
++	"encoding/binary"
++	"encoding/hex"
++	"fmt"
++	"time"
++
++	"github.com/r266-tech/wxkey/internal/dbfiles"
++	"github.com/r266-tech/wxkey/internal/machvm"
++	"github.com/r266-tech/wxkey/internal/verify"
++)
++
++// SQLCipher 4.1 codec_ctx/cipher_ctx layout, checked against Tencent's source
++// and the actual arm64 client. Every pointer is independently allocated; keys
++// need not be adjacent to the salt. Reject incompatible layouts before reading
++// their pointers, and accept only a complete keyspec plus a verified page MAC.
++const codecContextSize = 136
++
++var codecFields = [...]uint32{256000, 2, 16, 32, 16, 16, 4096}
++var codecNeedle = func() []byte {
++	b := make([]byte, 4*len(codecFields))
++	for i, value := range codecFields {
++		binary.LittleEndian.PutUint32(b[i*4:], value)
++	}
++	return b
++}()
++
++type memoryReader interface {
++	Read(uint64, []byte) (int, error)
++}
++
++func readCodecBytes(reader memoryReader, address uint64, size int) ([]byte, bool) {
++	if address == 0 || address+uint64(size) < address {
++		return nil, false
++	}
++	b := make([]byte, size)
++	n, err := reader.Read(address, b)
++	return b, err == nil && n == size
++}
++
++func inspectCodecContext(reader memoryReader, address uint64, dbs []dbfiles.DB, saltIdx map[string][]int) (Result, bool) {
++	miss := Result{}
++	ctx, ok := readCodecBytes(reader, address, codecContextSize)
++	if !ok || !bytes.Equal(ctx[4:32], codecNeedle) {
++		return miss, false
++	}
++	u32 := func(offset int) uint32 { return binary.LittleEndian.Uint32(ctx[offset:]) }
++	u64 := func(offset int) uint64 { return binary.LittleEndian.Uint64(ctx[offset:]) }
++	if u32(0) > 1 || u32(56) > 1 || u32(32) != 99 || u32(36) != 80 || u32(40) != 64 || u32(44) != 0 ||
++		u32(48) != 2 || u32(52) != 2 || u32(60) != 0 || u32(64)&3 != 3 {
++		return miss, false
++	}
++	salt, ok := readCodecBytes(reader, u64(72), 16)
++	if !ok {
++		return miss, false
++	}
++	saltHex := hex.EncodeToString(salt)
++	indices := saltIdx[string(salt)]
++	if len(indices) == 0 {
++		return miss, false
++	}
++	macSalt, ok := readCodecBytes(reader, u64(80), 16)
++	if !ok {
++		return miss, false
++	}
++	for i := range salt {
++		if macSalt[i] != salt[i]^0x3a {
++			return miss, false
++		}
++	}
++	cipher, ok := readCodecBytes(reader, u64(104), 40)
++	if !ok || binary.LittleEndian.Uint32(cipher) != 0 {
++		return miss, false
++	}
++	pointer := func(offset int) uint64 { return binary.LittleEndian.Uint64(cipher[offset:]) }
++	key, ok := readCodecBytes(reader, pointer(8), 32)
++	if !ok {
++		return miss, false
++	}
++	macKey, ok := readCodecBytes(reader, pointer(16), 32)
++	if !ok {
++		return miss, false
++	}
++	keyspec, ok := readCodecBytes(reader, pointer(32), 99)
++	if !ok {
++		return miss, false
++	}
++
++	// Newer clients protect key, HMAC key and x'<key><salt>' with the same
++	// repeating 32-byte XOR. The known salt suffix spans exactly one period,
++	// so derive the encoding from the structure itself, not a version/mask
++	// table. An unprotected structure yields the all-zero mask naturally.
++	var mask [32]byte
++	for i := range mask {
++		mask[(66+i)%32] = keyspec[66+i] ^ saltHex[i]
++	}
++	for i := range key {
++		key[i] ^= mask[i]
++		macKey[i] ^= mask[i]
++	}
++	for i := range keyspec {
++		keyspec[i] ^= mask[i%32]
++	}
++	keyHex := hex.EncodeToString(key)
++	if string(keyspec) != "x'"+keyHex+saltHex+"'" {
++		return miss, false
++	}
++	derived, err := pbkdf2.Key(sha512.New, string(key), macSalt, 2, 32)
++	if err != nil || !hmac.Equal(derived, macKey) {
++		return miss, false
++	}
++	for _, index := range indices {
++		if index < 0 || index >= len(dbs) {
++			continue
++		}
++		db := dbs[index]
++		if !verify.VerifyAsEncKey(key, db.Page1) {
++			continue
++		}
++		return Result{DBRel: db.Rel, DBPath: db.Path, SaltHex: saltHex, KeyHex: keyHex, VerifyAs: "enc_key"}, true
++	}
++	return miss, false
++}
++
++type heapReader struct {
++	memoryReader
++	regions []memRegion
++}
++
++func (r heapReader) Read(address uint64, dst []byte) (int, error) {
++	for _, region := range r.regions {
++		if address >= region.addr && uint64(len(dst)) <= region.size && address-region.addr <= region.size-uint64(len(dst)) {
++			return r.memoryReader.Read(address, dst)
++		}
++	}
++	return 0, fmt.Errorf("codec pointer is outside readable heap")
++}
++
++func runCodecContextScan(pid int32, dbs []dbfiles.DB, saltIdx map[string][]int, opts Options, progress ProgressFn) (map[string]Result, Stats, error) {
++	start := time.Now()
++	results := map[string]Result{}
++	stats := Stats{}
++	finish := func(err error) (map[string]Result, Stats, error) {
++		stats.Found, stats.Elapsed = len(results), time.Since(start)
++		return results, stats, err
++	}
++	expired := func() bool { return !opts.Deadline.IsZero() && !time.Now().Before(opts.Deadline) }
++	if len(dbs) == 0 {
++		return finish(fmt.Errorf("scan.Run: no DBs to verify against"))
++	}
++	if expired() {
++		return finish(ErrDeadlineExceeded)
++	}
++	proc, err := machvm.Attach(pid)
++	if err != nil {
++		return finish(err)
++	}
++	defer proc.Detach()
++	var regions []memRegion
++	if err := proc.Regions(func(r machvm.Region) bool {
++		if isCodecHeapRegion(r) {
++			regions = append(regions, memRegion{r.Address, r.Size})
++		}
++		return !expired()
++	}); err != nil {
++		return finish(fmt.Errorf("enumerate regions: %w", err))
++	}
++	stats.Regions = len(regions)
++	reader := heapReader{proc, regions}
++	seen := map[uint64]struct{}{}
++	chunk := make([]byte, chunkSize+len(codecNeedle))
++	for _, region := range regions {
++		var carry []byte
++		for offset := uint64(0); offset < region.size; {
++			if expired() {
++				return finish(ErrDeadlineExceeded)
++			}
++			n := min(uint64(chunkSize), region.size-offset)
++			copy(chunk, carry)
++			read, err := proc.Read(region.addr+offset, chunk[len(carry):len(carry)+int(n)])
++			if err != nil || read == 0 {
++				stats.ReadFailures++
++				carry = nil
++				offset += n
++				continue
++			}
++			view := chunk[:len(carry)+read]
++			base := region.addr + offset - uint64(len(carry))
++			stats.BytesScanned += uint64(read)
++			for pos := 0; pos < len(view); {
++				found := bytes.Index(view[pos:], codecNeedle)
++				if found < 0 {
++					break
++				}
++				pos += found
++				address := base + uint64(pos) - 4
++				pos++
++				if expired() {
++					return finish(ErrDeadlineExceeded)
++				}
++				if address%8 != 0 {
++					continue
++				}
++				if _, exists := seen[address]; exists {
++					continue
++				}
++				seen[address] = struct{}{}
++				stats.CodecCandidates++
++				if result, ok := inspectCodecContext(reader, address, dbs, saltIdx); ok {
++					stats.VerifiedContexts++
++					rawSalt, _ := hex.DecodeString(result.SaltHex)
++					results[string(rawSalt)] = result
++					stats.Found = len(results)
++					if len(results) == len(saltIdx) {
++						return finish(nil)
++					}
++				}
++			}
++			carry = append(carry[:0], view[max(0, len(view)-len(codecNeedle)+1):]...)
++			offset += n
++			if progress != nil {
++				stats.Elapsed = time.Since(start)
++				progress(stats)
++			}
++		}
++	}
++	return finish(nil)
++}
++
++// macOS nano heaps are normally 512 MiB. A shared-cache size heuristic must
++// not exclude writable heaps; the scan already uses fixed-size chunks and a
++// deadline, and executable/readonly image mappings remain excluded.
++func isCodecHeapRegion(r machvm.Region) bool {
++	return r.IsReadable() && r.IsWritable() && !r.IsExecutable() && r.Size > 0
++}
+--- /dev/null
++++ b/internal/scan/codec_context_test.go
+@@ -0,0 +1,404 @@
++package scan
++
++import (
++	"crypto/hmac"
++	"crypto/pbkdf2"
++	"crypto/sha512"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/r266-tech/wxkey/internal/dbfiles"
++	"github.com/r266-tech/wxkey/internal/machvm"
++)
++
++// Each synthetic allocation is more than 4 KiB from every other allocation.
++// A salt-neighborhood search cannot recover the key from this fixture.
++const (
++	codecFixtureAddress     uint64 = 0x100000
++	codecFixtureSalt        uint64 = 0x120000
++	codecFixtureMACSalt     uint64 = 0x140000
++	codecFixtureRead        uint64 = 0x160000
++	codecFixtureKey         uint64 = 0x180000
++	codecFixtureMACKey      uint64 = 0x1a0000
++	codecFixtureKeySpec     uint64 = 0x1c0000
++	codecFixtureBuffer      uint64 = 0x1e0000
++	codecFixtureBtree       uint64 = 0x200000
++	codecFixtureProvider    uint64 = 0x220000
++	codecFixtureProviderCtx uint64 = 0x240000
++)
++
++type codecFixtureReadFault struct {
++	short bool
++	err   error
++}
++
++// codecFixtureMemory only serves test-owned byte slices. It never attaches to
++// a process or opens the database paths carried in the result metadata.
++type codecFixtureMemory struct {
++	blocks map[uint64][]byte
++	faults map[uint64]codecFixtureReadFault
++}
++
++func (m *codecFixtureMemory) Read(address uint64, out []byte) (int, error) {
++	for base, block := range m.blocks {
++		if address < base || address-base >= uint64(len(block)) {
++			continue
++		}
++		fault := m.faults[base]
++		if fault.short && len(out) > 0 {
++			out = out[:len(out)-1]
++		}
++		n := copy(out, block[int(address-base):])
++		return n, fault.err
++	}
++	return 0, errors.New("unmapped synthetic address")
++}
++
++type codecFixture struct {
++	memory  *codecFixtureMemory
++	dbs     []dbfiles.DB
++	saltIdx map[string][]int
++	key     []byte
++	salt    []byte
++	mask    []byte
++}
++
++func newCodecFixture(t *testing.T, masked bool) *codecFixture {
++	t.Helper()
++	f := &codecFixture{
++		memory: &codecFixtureMemory{
++			blocks: make(map[uint64][]byte),
++			faults: make(map[uint64]codecFixtureReadFault),
++		},
++		key:  make([]byte, 32),
++		salt: make([]byte, 16),
++		mask: make([]byte, 32),
++	}
++	for i := range f.key {
++		f.key[i] = byte(i*29 + 11)
++		if masked {
++			f.mask[i] = byte(i*37 + 19)
++		}
++	}
++	// Real keys may contain NUL bytes; context validation must not use the
++	// heuristic filter applied to arbitrary binary password candidates.
++	f.key[0], f.key[1] = 0, 0
++	for i := range f.salt {
++		f.salt[i] = byte(i*13 + 49)
++	}
++	f.memory.blocks[codecFixtureSalt] = append([]byte(nil), f.salt...)
++	macSalt := make([]byte, 16)
++	for i, b := range f.salt {
++		macSalt[i] = b ^ 0x3a
++	}
++	f.memory.blocks[codecFixtureMACSalt] = macSalt
++
++	// The fixture encodes the documented SQLCipher 4.1 64-bit ABI directly,
++	// independently of the production parser's constants and helpers.
++	codec := make([]byte, 136)
++	fields := []uint32{0, 256000, 2, 16, 32, 16, 16, 4096, 99, 80, 64, 0, 2, 2, 0, 0, 3}
++	for i, value := range fields {
++		binary.LittleEndian.PutUint32(codec[i*4:], value)
++	}
++	pointers := []uint64{
++		codecFixtureSalt, codecFixtureMACSalt, codecFixtureBuffer,
++		codecFixtureBtree, codecFixtureRead, codecFixtureRead,
++		codecFixtureProvider, codecFixtureProviderCtx,
++	}
++	for i, pointer := range pointers {
++		binary.LittleEndian.PutUint64(codec[72+i*8:], pointer)
++	}
++	f.memory.blocks[codecFixtureAddress] = codec
++	read := make([]byte, 40)
++	binary.LittleEndian.PutUint64(read[8:], codecFixtureKey)
++	binary.LittleEndian.PutUint64(read[16:], codecFixtureMACKey)
++	binary.LittleEndian.PutUint64(read[32:], codecFixtureKeySpec)
++	f.memory.blocks[codecFixtureRead] = read
++	f.storeKeys(t, f.key)
++
++	page := make([]byte, 4096)
++	copy(page, f.salt)
++	for i := 16; i < 4032; i++ {
++		page[i] = byte(i*17 + 7)
++	}
++	macKey := codecFixtureMAC(t, f.key, f.salt)
++	codecFixtureSign(page, macKey, []byte{1, 0, 0, 0})
++	f.dbs = []dbfiles.DB{{
++		Path: "/synthetic/codec-context/message_0.db",
++		Rel:  "message/message_0.db", Page1: page, Salt: page[:16],
++	}}
++	f.saltIdx = map[string][]int{string(f.salt): {0}}
++	return f
++}
++
++func codecFixtureMAC(t *testing.T, key, salt []byte) []byte {
++	t.Helper()
++	macSalt := make([]byte, len(salt))
++	for i, b := range salt {
++		macSalt[i] = b ^ 0x3a
++	}
++	macKey, err := pbkdf2.Key(sha512.New, string(key), macSalt, 2, 32)
++	if err != nil {
++		t.Fatalf("derive synthetic HMAC key: %v", err)
++	}
++	return macKey
++}
++
++func codecFixtureSign(page, macKey, pageNumber []byte) {
++	mac := hmac.New(sha512.New, macKey)
++	mac.Write(page[16:4032])
++	mac.Write(pageNumber)
++	copy(page[4032:], mac.Sum(nil))
++}
++
++func (f *codecFixture) encode(data []byte) []byte {
++	out := make([]byte, len(data))
++	for i, b := range data {
++		out[i] = b ^ f.mask[i%32]
++	}
++	return out
++}
++
++func (f *codecFixture) storeKeys(t *testing.T, key []byte) {
++	t.Helper()
++	f.memory.blocks[codecFixtureKey] = f.encode(key)
++	f.memory.blocks[codecFixtureMACKey] = f.encode(codecFixtureMAC(t, key, f.salt))
++	spec := "x'" + hex.EncodeToString(key) + hex.EncodeToString(f.salt) + "'"
++	f.memory.blocks[codecFixtureKeySpec] = f.encode([]byte(spec))
++}
++
++func TestInspectCodecContextRecoversDispersedAllocations(t *testing.T) {
++	for _, masked := range []bool{false, true} {
++		t.Run(fmt.Sprintf("masked=%t", masked), func(t *testing.T) {
++			f := newCodecFixture(t, masked)
++			got, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx)
++			if !ok {
++				t.Fatal("valid dispersed codec context was rejected")
++			}
++			if got.KeyHex != hex.EncodeToString(f.key) {
++				t.Fatalf("KeyHex = %q, want recovered enc_key %q", got.KeyHex, hex.EncodeToString(f.key))
++			}
++			if got.SaltHex != hex.EncodeToString(f.salt) || got.DBRel != f.dbs[0].Rel || got.DBPath != f.dbs[0].Path {
++				t.Fatalf("result metadata does not identify the verified database: %+v", got)
++			}
++		})
++	}
++}
++
++func TestInspectCodecContextRejectsInvalidEvidence(t *testing.T) {
++	tests := []struct {
++		name   string
++		mutate func(*testing.T, *codecFixture)
++	}{
++		{"unknown salt", func(_ *testing.T, f *codecFixture) {
++			f.memory.blocks[codecFixtureSalt][0] ^= 0x80
++		}},
++		{"empty salt index", func(_ *testing.T, f *codecFixture) {
++			f.saltIdx = nil
++		}},
++		{"wrong HMAC salt", func(_ *testing.T, f *codecFixture) {
++			f.memory.blocks[codecFixtureMACSalt][0] ^= 0x80
++		}},
++		{"wrong stored HMAC key", func(_ *testing.T, f *codecFixture) {
++			f.memory.blocks[codecFixtureMACKey][0] ^= 0x80
++		}},
++		{"consistent keys for a different database", func(t *testing.T, f *codecFixture) {
++			wrong := append([]byte(nil), f.key...)
++			wrong[17] ^= 0x80
++			f.storeKeys(t, wrong)
++		}},
++		{"corrupt ciphertext", func(_ *testing.T, f *codecFixture) {
++			f.dbs[0].Page1[16] ^= 1
++		}},
++		{"corrupt IV", func(_ *testing.T, f *codecFixture) {
++			f.dbs[0].Page1[4016] ^= 1
++		}},
++		{"corrupt page HMAC", func(_ *testing.T, f *codecFixture) {
++			f.dbs[0].Page1[4095] ^= 1
++		}},
++		{"wrong page number", func(t *testing.T, f *codecFixture) {
++			codecFixtureSign(f.dbs[0].Page1, codecFixtureMAC(t, f.key, f.salt), []byte{2, 0, 0, 0})
++		}},
++		{"big endian page number", func(t *testing.T, f *codecFixture) {
++			codecFixtureSign(f.dbs[0].Page1, codecFixtureMAC(t, f.key, f.salt), []byte{0, 0, 0, 1})
++		}},
++		{"short first page", func(_ *testing.T, f *codecFixture) {
++			f.dbs[0].Page1 = f.dbs[0].Page1[:4095]
++		}},
++		{"derivation unfinished", func(_ *testing.T, f *codecFixture) {
++			binary.LittleEndian.PutUint32(f.memory.blocks[codecFixtureRead], 1)
++		}},
++	}
++	for _, tc := range tests {
++		for _, masked := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/masked=%t", tc.name, masked), func(t *testing.T) {
++				f := newCodecFixture(t, masked)
++				tc.mutate(t, f)
++				if _, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx); ok {
++					t.Fatal("invalid codec context was accepted")
++				}
++			})
++		}
++	}
++}
++
++func TestInspectCodecContextRequiresCompleteKeySpec(t *testing.T) {
++	tests := []struct {
++		name   string
++		offset int
++		value  byte
++	}{
++		{"wrong prefix", 0, 'y'},
++		{"missing opening quote", 1, ' '},
++		{"non hexadecimal key", 12, 'g'},
++		{"different key", 2, 'f'},
++		{"different embedded salt", 66, 'f'},
++		{"missing closing quote", 98, ' '},
++	}
++	for _, tc := range tests {
++		for _, masked := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/masked=%t", tc.name, masked), func(t *testing.T) {
++				f := newCodecFixture(t, masked)
++				spec := []byte("x'" + hex.EncodeToString(f.key) + hex.EncodeToString(f.salt) + "'")
++				spec[tc.offset] = tc.value
++				f.memory.blocks[codecFixtureKeySpec] = f.encode(spec)
++				if _, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx); ok {
++					t.Fatal("incomplete or inconsistent keyspec was accepted")
++				}
++			})
++		}
++	}
++}
++
++func TestInspectCodecContextRejectsIncompatibleLayout(t *testing.T) {
++	fields := []struct {
++		name   string
++		offset int
++		value  uint32
++	}{
++		{"store_pass", 0, 2}, {"kdf_iter", 4, 64000},
++		{"fast_kdf_iter", 8, 1}, {"salt_sz", 12, 8},
++		{"key_sz", 16, 16}, {"iv_sz", 20, 8},
++		{"block_sz", 24, 8}, {"page_sz", 28, 1024},
++		{"keyspec_sz", 32, 98}, {"reserve_sz", 36, 48},
++		{"hmac_sz", 40, 32}, {"plaintext_header_sz", 44, 16},
++		{"hmac_algorithm", 48, 1}, {"kdf_algorithm", 52, 1},
++		{"skip_read_hmac", 56, 2}, {"need_kdf_salt", 60, 1},
++		{"flags", 64, 0},
++	}
++	for _, field := range fields {
++		t.Run(field.name, func(t *testing.T) {
++			f := newCodecFixture(t, true)
++			binary.LittleEndian.PutUint32(f.memory.blocks[codecFixtureAddress][field.offset:], field.value)
++			if _, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx); ok {
++				t.Fatal("incompatible codec layout was accepted")
++			}
++		})
++	}
++}
++
++func TestInspectCodecContextRejectsBadPointers(t *testing.T) {
++	pointers := []struct {
++		name   string
++		owner  uint64
++		offset int
++	}{
++		{"salt", codecFixtureAddress, 72},
++		{"HMAC salt", codecFixtureAddress, 80},
++		{"read context", codecFixtureAddress, 104},
++		{"key", codecFixtureRead, 8},
++		{"HMAC key", codecFixtureRead, 16},
++		{"keyspec", codecFixtureRead, 32},
++	}
++	for _, pointer := range pointers {
++		for _, address := range []uint64{0, 0xdead0000, ^uint64(0) - 15} {
++			t.Run(fmt.Sprintf("%s/%#x", pointer.name, address), func(t *testing.T) {
++				f := newCodecFixture(t, true)
++				binary.LittleEndian.PutUint64(f.memory.blocks[pointer.owner][pointer.offset:], address)
++				if _, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx); ok {
++					t.Fatal("invalid pointer was accepted")
++				}
++			})
++		}
++	}
++}
++
++func TestInspectCodecContextRejectsIncompleteReads(t *testing.T) {
++	allocations := []struct {
++		name    string
++		address uint64
++	}{
++		{"codec", codecFixtureAddress}, {"salt", codecFixtureSalt},
++		{"HMAC salt", codecFixtureMACSalt}, {"read context", codecFixtureRead},
++		{"key", codecFixtureKey}, {"HMAC key", codecFixtureMACKey},
++		{"keyspec", codecFixtureKeySpec},
++	}
++	for _, allocation := range allocations {
++		for _, faultName := range []string{"short read without error", "full read with error"} {
++			t.Run(allocation.name+"/"+faultName, func(t *testing.T) {
++				f := newCodecFixture(t, true)
++				fault := codecFixtureReadFault{short: true}
++				if faultName == "full read with error" {
++					fault = codecFixtureReadFault{err: errors.New("synthetic read failure")}
++				}
++				f.memory.faults[allocation.address] = fault
++				if _, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx); ok {
++					t.Fatal("incomplete or failed memory read was accepted")
++				}
++			})
++		}
++	}
++}
++
++func TestInspectCodecContextTriesAllDatabasesWithMatchingSalt(t *testing.T) {
++	f := newCodecFixture(t, true)
++	badPage := append([]byte(nil), f.dbs[0].Page1...)
++	badPage[4095] ^= 1
++	badDB := dbfiles.DB{
++		Path: "/synthetic/codec-context/corrupt.db", Rel: "message/corrupt.db",
++		Page1: badPage, Salt: badPage[:16],
++	}
++	f.dbs = append([]dbfiles.DB{badDB}, f.dbs...)
++	f.saltIdx[string(f.salt)] = []int{0, 1}
++	got, ok := inspectCodecContext(f.memory, codecFixtureAddress, f.dbs, f.saltIdx)
++	if !ok || got.DBPath != f.dbs[1].Path || got.KeyHex != hex.EncodeToString(f.key) {
++		t.Fatalf("did not select the authenticated database after a corrupt same-salt page: ok=%t result=%+v", ok, got)
++	}
++}
++
++func TestRunWithOptionsExpiredDeadlineAvoidsProcessAccess(t *testing.T) {
++	f := newCodecFixture(t, true)
++	results, stats, err := RunWithOptions(-1, f.dbs, f.saltIdx, Options{
++		Deadline: time.Unix(1, 0),
++	}, func(Stats) {
++		t.Fatal("progress callback ran despite an already expired deadline")
++	})
++	if !errors.Is(err, ErrDeadlineExceeded) {
++		t.Fatalf("error = %v, want ErrDeadlineExceeded before attempting to attach to pid -1", err)
++	}
++	if len(results) != 0 || stats.Found != 0 || stats.Regions != 0 || stats.BytesScanned != 0 {
++		t.Fatalf("expired scan performed work: results=%d stats=%+v", len(results), stats)
++	}
++}
++
++func TestCodecScanIncludesMacOSNanoHeap(t *testing.T) {
++	nano := machvm.Region{Address: 0x100000, Size: 512 * 1024 * 1024, Protection: machvm.VM_PROT_READ | machvm.VM_PROT_WRITE}
++	if !isCodecHeapRegion(nano) {
++		t.Fatal("normal 512 MiB nano heap containing codec contexts was skipped")
++	}
++	for _, protection := range []int32{machvm.VM_PROT_READ, machvm.VM_PROT_READ | machvm.VM_PROT_WRITE | machvm.VM_PROT_EXECUTE} {
++		image := nano
++		image.Protection = protection
++		if isCodecHeapRegion(image) {
++			t.Fatal("image mapping selected as writable non-executable heap")
++		}
++	}
++	nano.Size = 0
++	if isCodecHeapRegion(nano) {
++		t.Fatal("empty region selected")
++	}
++}
+--- /dev/null
++++ b/cmd/wxkey/codec_bootstrap_test.go
+@@ -0,0 +1,37 @@
++package main
++
++import (
++	"slices"
++	"testing"
++)
++
++func TestBootstrapReusesDatabaseConfigWithoutImagePreparation(t *testing.T) {
++	cfg := wxcliConfig{DBRoot: "/synthetic/account", Keys: map[string]string{"synthetic-salt": "synthetic-key"}}
++	if !bootstrapCanReuseConfig(cfg, false) {
++		t.Fatal("ready text database configuration would prepare another shadow/login for an optional image key")
++	}
++	if bootstrapCanReuseConfig(cfg, true) {
++		t.Fatal("explicit image request was incorrectly treated as ready")
++	}
++	value := 7
++	cfg.ImageKey, cfg.ImageXORKey = "abcdefghijklmnop", &value
++	if !bootstrapCanReuseConfig(cfg, true) {
++		t.Fatal("existing image and database configuration was not reused")
++	}
++	cfg.Keys = nil
++	if bootstrapCanReuseConfig(cfg, false) {
++		t.Fatal("missing database keys were accepted")
++	}
++}
++
++func TestBootstrapForwardsExplicitImageRequestToSetup(t *testing.T) {
++	flags := scanFlags{pid: 123, root: "/synthetic/account", config: "/synthetic/config.json"}
++	want := []string{"/synthetic/wxkey", "setup", "--pid", "123", "--root", flags.root, "--config", flags.config}
++	if got := setupCommandArgs("/synthetic/wxkey", flags); !slices.Equal(got, want) {
++		t.Fatalf("text setup protocol changed: %v", got)
++	}
++	flags.imageKey = true
++	if got := setupCommandArgs("/synthetic/wxkey", flags); !slices.Equal(got, append(want, "--image-key")) {
++		t.Fatalf("explicit image request was lost at child setup boundary: %v", got)
++	}
++}
+--- /dev/null
++++ b/cmd/wxkey/shadow_storage_test.go
+@@ -0,0 +1,18 @@
++package main
++
++import (
++ "path/filepath"
++ "testing"
++)
++
++func TestShadowStorageAcrossAttempts(t *testing.T) {
++ home := filepath.Join(t.TempDir(), ".wxkey-bootstrap")
++ shared := filepath.Join(home, "Library", "Application Support", "wx-mcp")
++ t.Setenv("WXKEY_SHADOW_WECHAT_APP", filepath.Join(shared, "WeChat-shadow.app"))
++ for _, attempt := range []string{"first", "retry"} {
++  root, err := shadowStorageRoot(filepath.Join(home, attempt, "key_config.json"))
++  if err != nil || root != shared { t.Fatalf("attempt did not retain shared app: %v", err) }
++ }
++ t.Setenv("WXKEY_SHADOW_WECHAT_APP", filepath.Join(t.TempDir(), "WeChat-shadow.app"))
++ if _, err := shadowStorageRoot(filepath.Join(home, "retry", "key_config.json")); err == nil { t.Fatal("accepted unrelated app path") }
++}
+--- a/cmd/wxkey/process_scope_test.go
++++ b/cmd/wxkey/process_scope_test.go
+@@ -173,9 +173,10 @@
+ 	f := parseFlags([]string{"--config", config})
+ 	shadow := filepath.Join(filepath.Dir(config), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
+ 	t.Setenv("WXKEY_SHADOW_WECHAT_APP", filepath.Join(home, "unrelated.app"))
+-	if f.config != config || shadowWeChatPath() != shadow || effectiveUserHome() != home {
++	if f.config != config || shadowWeChatPath() != "" || effectiveUserHome() != home {
+ 		t.Fatal("config-owned shadow changed the invoking home or accepted an unrelated shadow override")
+ 	}
++	t.Setenv("WXKEY_SHADOW_WECHAT_APP", "")
+ 	if _, _, _, err := validateShadowWeChatPath(shadow); err != nil {
+ 		t.Fatalf("operation shadow rejected: %v", err)
+ 	}
+--- /dev/null
++++ b/cmd/wxkey/shadow_launch_test.go
+@@ -0,0 +1,26 @@
++package main
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestLaunchErrorDoesNotDiscardConfirmedPrivateProcess(t *testing.T) {
++	launchErr := errors.New("launch services timed out while permission was pending")
++	confirmed := false
++	pid, err := launchAndConfirmShadow(func() error { return launchErr }, func() (int, error) {
++		confirmed = true
++		return 123, nil
++	})
++	if !confirmed || err != nil || pid != 123 {
++		t.Fatalf("discarded launched process: %d %v", pid, err)
++	}
++}
++
++func TestUnconfirmedLaunchRetainsBothErrors(t *testing.T) {
++	launchErr, confirmErr := errors.New("launch error"), errors.New("no verified private process")
++	pid, err := launchAndConfirmShadow(func() error { return launchErr }, func() (int, error) { return 0, confirmErr })
++	if pid != 0 || !errors.Is(err, launchErr) || !errors.Is(err, confirmErr) {
++		t.Fatalf("lost actual startup failure: %d %v", pid, err)
++	}
++}

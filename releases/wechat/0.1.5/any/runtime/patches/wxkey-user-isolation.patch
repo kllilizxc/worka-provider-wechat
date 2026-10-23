@@ -1,0 +1,1799 @@
+diff --git a/cmd/wxkey/main.go b/cmd/wxkey/main.go
+--- a/cmd/wxkey/main.go
++++ b/cmd/wxkey/main.go
+@@ -34,7 +34,7 @@
+   wxkey image-key  [--pid N] [--root /path/to/xwechat_files/<wxid>] [--quiet]
+   wxkey setup      [--pid N] [--root ...] [--config ~/.config/wxcli/config.json]
+   wxkey doctor     [--pid N] [--root ...] [--config ...] [--quiet] [--scan]
+-  wxkey resign-wechat
++  wxkey resign-wechat (disabled: the installed app is shared across macOS users)
+   wxkey list-pids
+   wxkey -h | --help
+ 
+@@ -59,17 +59,14 @@
+               It does not scan memory by default; pass --scan for the slower
+               live task_for_pid + key coverage check.
+   resign-wechat
+-              Operator diagnostic path: quit WeChat, ad-hoc re-sign
+-              /Applications/WeChat.app, then reopen it. Bootstrap uses a
+-              wechat-cli shadow copy by default to avoid App Store app-management
+-              prompts.
++              Disabled because the installed app is shared across macOS users.
++              Bootstrap uses a shadow copy under the invoking user's home.
+   list-pids   Print one WeChat PID per line (or empty if not running).
+ 
+ Notes:
+-  - WeChat must be running and have opened at least one DB this session.
+-  - SIP stays enabled. First-time key extraction uses one route only:
+-    ad-hoc-signed WeChat + administrator privileges. Bootstrap signs a
+-    wechat-cli-managed shadow copy when the installed WeChat cannot be modified.
++  - WeChat must be running for the invoking user and have opened at least one DB this session.
++  - SIP stays enabled. First-time key extraction uses an ad-hoc-signed shadow
++    copy under the invoking user's home plus administrator authorization.
+   - wxkey never reads or stores the administrator password. When direct attach
+     fails, macOS displays its system administrator authentication dialog via
+     osascript. Every future refresh that needs elevation requires a new macOS
+@@ -80,6 +77,11 @@
+ 	if len(os.Args) < 2 {
+ 		fmt.Fprint(os.Stderr, usage)
+ 		os.Exit(2)
++	}
++	if os.Geteuid() == 0 && os.Args[1] != "-h" && os.Args[1] != "--help" && os.Args[1] != "help" {
++		if _, err := invokingIdentity(); err != nil {
++			fail("refusing elevated execution without a verified invoking-user record: %v", err)
++		}
+ 	}
+ 	startOrphanWatchdog()
+ 	switch os.Args[1] {
+@@ -105,6 +107,9 @@
+ 		os.Exit(2)
+ 	}
+ }
++
++// One wxkey command owns one config and all of its staged artifacts.
++var commandConfigPath string
+ 
+ type scanFlags struct {
+ 	pid            int
+@@ -165,6 +170,13 @@
+ 			dieUsage("unknown flag: %s", a)
+ 		}
+ 	}
++	if f.config != "" {
++		clean, err := filepath.Abs(filepath.Clean(f.config))
++		if err != nil {
++			dieUsage("invalid --config: %v", err)
++		}
++		f.config = clean
++	}
+ 	if f.config != "" && configWriteIsElevated() {
+ 		validated, err := validateConfigPathForWrite(f.config, true)
+ 		if err != nil {
+@@ -172,6 +184,7 @@
+ 		}
+ 		f.config = validated
+ 	}
++	commandConfigPath = f.config
+ 	return f
+ }
+ 
+@@ -222,6 +235,9 @@
+ 		}
+ 		pid = p
+ 	}
++	if _, err := verifiedWechatPID(pid); err != nil {
++		fail("refusing to scan WeChat PID %d: %v", pid, err)
++	}
+ 	root := f.root
+ 	if root == "" {
+ 		r, err := pickAccountRoot()
+@@ -256,7 +272,7 @@
+ 				stats.Elapsed.Round(time.Second), len(results), len(saltIdx))
+ 		} else {
+ 			// Auto-elevate on permission failure.
+-			if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
++			if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && os.Geteuid() != 0 {
+ 				logf(f.quiet, "[wxkey] task_for_pid denied; requesting macOS administrator authorization...\n")
+ 				if reErr := reExecElevated(); reErr != nil {
+ 					fail("%s", buildElevateFailHint(reErr, err))
+@@ -501,18 +517,28 @@
+ }
+ 
+ func runListPids() {
+-	pids, err := wechatPIDs()
++	processes, _, err := invokerWechatProcesses()
+ 	if err != nil {
+ 		fail("list pids: %v", err)
+ 	}
+-	for _, p := range pids {
+-		fmt.Println(p)
++	for _, process := range processes {
++		fmt.Println(process.PID)
+ 	}
+ }
+ 
+ func runImageKey(args []string) {
+ 	f := parseFlags(args)
+ 	pid := f.pid
++	if pid == 0 {
++		var err error
++		pid, err = pickWeChatPID()
++		if err != nil {
++			fail("%v", err)
++		}
++	}
++	if _, err := verifiedWechatPID(pid); err != nil {
++		fail("refusing to scan WeChat PID %d: %v", pid, err)
++	}
+ 	root := f.root
+ 	if root == "" {
+ 		r, err := pickAccountRoot()
+@@ -523,7 +549,7 @@
+ 	}
+ 	img, err := scanImageKey(pid, root, f.quiet)
+ 	if err != nil {
+-		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
++		if isPermissionErr(err) && !envTrue("WXKEY_NO_ELEVATE") && os.Geteuid() != 0 {
+ 			logf(f.quiet, "[wxkey] task_for_pid denied; requesting macOS administrator authorization...\n")
+ 			if reErr := reExecElevated(); reErr != nil {
+ 				fail("%s", buildElevateFailHint(reErr, err))
+@@ -592,20 +618,13 @@
+ 			fmt.Fprintf(os.Stderr, "       codesign output: %s\n", sig.Raw)
+ 		}
+ 	} else if sig.Runtime && !sig.AdHoc {
+-		if envTrue("WXKEY_BOOTSTRAP_ORIGINAL_WECHAT") {
+-			fmt.Println("[INFO] WeChat has official Hardened Runtime; applying explicit original-app resign route.")
+-			if err := runSelfPassthrough("resign-wechat"); err != nil {
+-				fail("resign-wechat failed: %v", err)
+-			}
+-		} else {
+-			fmt.Println("[INFO] WeChat has official Hardened Runtime; using wechat-cli shadow copy for no-SIP bootstrap.")
+-			pid, done, err := prepareShadowWeChat()
+-			if err != nil {
+-				fail("prepare shadow WeChat: %v", err)
+-			}
+-			setupFlags.pid = pid
+-			cleanup = done
+-		}
++		fmt.Println("[INFO] WeChat has official Hardened Runtime; using this user's isolated shadow copy for no-SIP bootstrap.")
++		pid, done, err := prepareShadowWeChat()
++		if err != nil {
++			fail("prepare shadow WeChat: %v", err)
++		}
++		setupFlags.pid = pid
++		cleanup = done
+ 	} else if sig.AdHoc {
+ 		fmt.Println("[OK]   WeChat is already ad-hoc signed.")
+ 	} else {
+@@ -663,10 +682,6 @@
+ 	if err != nil {
+ 		fmt.Fprintf(os.Stderr, "[wxkey] initial passive scan did not capture DB keys before its deadline.\n")
+ 		fmt.Fprintf(os.Stderr, "        Trying PBKDF breakpoint fallback for WeChat 4.1.x...\n")
+-		if setupFlags.pid > 0 {
+-			_ = syscall.Kill(setupFlags.pid, syscall.SIGTERM)
+-			time.Sleep(1 * time.Second)
+-		}
+ 		res, err = runPBKDFProbeCaptured(setupFlags, cfgPath)
+ 		if err != nil {
+ 			fmt.Fprintf(os.Stderr, "        If WeChat just reopened, wait until it is fully logged in, open one chat, then rerun `wxkey bootstrap`.\n")
+@@ -698,7 +713,7 @@
+ }
+ 
+ func configWriteIsElevated() bool {
+-	return os.Geteuid() == 0 || envTrue("WXKEY_ELEVATED")
++	return os.Geteuid() == 0
+ }
+ 
+ func validateConfigPathForWrite(path string, elevated bool) (string, error) {
+@@ -710,17 +725,14 @@
+ 		return "", err
+ 	}
+ 	if elevated {
+-		defaultPath, err := filepath.Abs(filepath.Clean(defaultConfigPath()))
++		identity, err := invokingIdentity()
+ 		if err != nil {
+ 			return "", err
+ 		}
+-		if clean != defaultPath {
+-			return "", fmt.Errorf("elevated wxkey may only write the invoking user's default config %s", defaultPath)
+-		}
+-		home, err := filepath.Abs(filepath.Clean(effectiveUserHome()))
+-		if err != nil {
+-			return "", err
+-		}
++		if clean != identity.ConfigPath {
++			return "", fmt.Errorf("elevated wxkey may only write the invoking command's config")
++		}
++		home := identity.Home
+ 		rel, err := filepath.Rel(home, clean)
+ 		if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+ 			return "", fmt.Errorf("elevated config path escapes invoking user's home")
+@@ -922,15 +934,19 @@
+ }
+ 
+ func invokingUserIDs() (int, int, bool) {
+-	info, err := os.Stat(effectiveUserHome())
++	identity, err := invokingIdentity()
+ 	if err != nil {
+ 		return 0, 0, false
+ 	}
+-	sys, ok := info.Sys().(*syscall.Stat_t)
+-	if !ok {
++	entry, err := userpkg.LookupId(strconv.Itoa(identity.UID))
++	if err != nil {
+ 		return 0, 0, false
+ 	}
+-	return int(sys.Uid), int(sys.Gid), true
++	gid, err := strconv.Atoi(entry.Gid)
++	if err != nil {
++		return 0, 0, false
++	}
++	return identity.UID, gid, true
+ }
+ 
+ func chownRootParents(root *os.Root, rel string, uid, gid int) error {
+@@ -979,34 +995,23 @@
+ 	return cfg.WxID == wxid && filepath.Clean(cfg.DBRoot) == filepath.Clean(root)
+ }
+ 
+-func runSelfPassthrough(args ...string) error {
+-	exe, err := os.Executable()
+-	if err != nil {
+-		return err
+-	}
+-	cmd := exec.Command(exe, args...)
+-	cmd.Stdout = os.Stdout
+-	cmd.Stderr = os.Stderr
+-	cmd.Stdin = os.Stdin
+-	return cmd.Run()
+-}
+-
+ func shadowWeChatPath() string {
+-	if p := strings.TrimSpace(os.Getenv("WXKEY_SHADOW_WECHAT_APP")); p != "" {
+-		return p
+-	}
+-	return filepath.Join(effectiveUserHome(), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	identity, err := invokingIdentity()
++	if err != nil {
++		return ""
++	}
++	return filepath.Join(filepath.Dir(identity.ConfigPath), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
+ }
+ 
+ func validateShadowWeChatPath(path string) (string, string, string, error) {
+ 	if strings.TrimSpace(path) == "" {
+ 		return "", "", "", fmt.Errorf("shadow WeChat path is empty")
+ 	}
+-	home, err := filepath.Abs(filepath.Clean(effectiveUserHome()))
++	identity, err := invokingIdentity()
+ 	if err != nil {
+ 		return "", "", "", err
+ 	}
+-	rootPath := filepath.Join(home, "Library", "Application Support", "wx-mcp")
++	rootPath := filepath.Join(filepath.Dir(identity.ConfigPath), "Library", "Application Support", "wx-mcp")
+ 	clean, err := filepath.Abs(filepath.Clean(path))
+ 	if err != nil {
+ 		return "", "", "", err
+@@ -1158,31 +1163,63 @@
+ }
+ 
+ func prepareShadowWeChat() (int, func(), error) {
+-	shadowPath, hadWeChatRunning, err := prepareShadowWeChatCopy()
++	shadowPath, stoppedOriginal, err := prepareShadowWeChatCopy()
+ 	if err != nil {
+ 		return 0, nil, err
+ 	}
+ 
+ 	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
+ 	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
++		reopenOriginalWeChatIf(stoppedOriginal)
+ 		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
+ 	}
+ 	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
+ 	if err != nil {
++		reopenOriginalWeChatIf(stoppedOriginal)
+ 		return 0, nil, err
++	}
++	process, err := verifiedWechatPID(pid)
++	if err != nil || process.Path != expectedWechatExecutable(shadowPath) {
++		reopenOriginalWeChatIf(stoppedOriginal)
++		if err != nil {
++			return 0, nil, fmt.Errorf("cannot verify newly opened shadow WeChat process: %w", err)
++		}
++		return 0, nil, fmt.Errorf("new WeChat process is outside the prepared shadow app")
+ 	}
+ 
+ 	cleanup := func() {
+ 		if envTrue("WXKEY_KEEP_SHADOW_WECHAT") {
+ 			return
+ 		}
+-		_ = exec.Command("/bin/kill", "-TERM", strconv.Itoa(pid)).Run()
+-		time.Sleep(1 * time.Second)
+-		if hadWeChatRunning && !envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
+-		}
+-	}
+-	return pid, cleanup, nil
++		current, checkErr := processSnapshot(process.PID)
++		if checkErr != nil && !pidAlive(process.PID) {
++			reopenOriginalWeChatIf(stoppedOriginal)
++			return
++		}
++		if checkErr != nil {
++			fmt.Fprintf(os.Stderr, "[wxkey] could not verify this user's shadow WeChat (PID %d): %v\n", pid, checkErr)
++			return
++		}
++		identity, identityErr := invokingIdentity()
++		if identityErr != nil {
++			fmt.Fprintf(os.Stderr, "[wxkey] could not verify invoking user during shadow cleanup: %v\n", identityErr)
++			return
++		}
++		if err := validateProcessForSignal(process, current, identity, shadowPath); err != nil {
++			fmt.Fprintf(os.Stderr, "[wxkey] could not safely stop this user's shadow WeChat (PID %d): %v\n", pid, err)
++			return
++		}
++		if err := signalVerifiedWechatProcess(process, shadowPath, syscall.SIGTERM); err != nil {
++			fmt.Fprintf(os.Stderr, "[wxkey] could not safely stop this user's shadow WeChat (PID %d): %v\n", pid, err)
++			return
++		}
++		if err := waitForWechatExit(process, shadowPath, 3*time.Second); err != nil {
++			fmt.Fprintf(os.Stderr, "[wxkey] shadow WeChat recovery needs manual attention: %v\n", err)
++			return
++		}
++		reopenOriginalWeChatIf(stoppedOriginal)
++	}
++	return pid, registerFailureCleanup(cleanup), nil
+ }
+ 
+ func prepareShadowWeChatCopy() (string, bool, error) {
+@@ -1190,19 +1227,33 @@
+ 	if err != nil {
+ 		return "", false, err
+ 	}
+-	hadWeChatRunning := false
+-	if pids, _ := wechatPIDs(); len(pids) > 0 {
+-		hadWeChatRunning = true
++	processes, _, err := invokerWechatProcesses()
++	if err != nil {
++		return "", false, err
++	}
++	stoppedOriginal := false
++	if len(processes) == 1 {
++		process := processes[0]
++		switch process.Path {
++		case expectedWechatExecutable(wechatAppPath):
++			if err := signalVerifiedWechatProcess(process, wechatAppPath, syscall.SIGTERM); err != nil {
++				return "", false, fmt.Errorf("stop this user's original WeChat: %w", err)
++			}
++			if err := waitForWechatExit(process, wechatAppPath, 3*time.Second); err != nil {
++				return "", false, err
++			}
++			stoppedOriginal = true
++		case expectedWechatExecutable(shadowPath):
++			return "", false, fmt.Errorf("this user's shadow WeChat is already running; close it before preparing a new copy")
++		default:
++			return "", false, fmt.Errorf("this user's WeChat process has an unexpected path; refusing to prepare a shadow copy")
++		}
+ 	}
+ 
+ 	fmt.Println("[INFO] Preparing wechat-cli WeChat shadow copy...")
+-	if err := exec.Command("/usr/bin/killall", "WeChat").Run(); err != nil {
+-		// killall exits non-zero when WeChat is not running. That is fine here.
+-	}
+-	time.Sleep(2 * time.Second)
+-
+ 	if err := safeRemoveShadowWeChat(shadowPath); err != nil {
+-		return "", hadWeChatRunning, fmt.Errorf("remove stale shadow copy %s: %w", shadowPath, err)
++		reopenOriginalWeChatIf(stoppedOriginal)
++		return "", false, fmt.Errorf("remove stale shadow copy %s: %w", shadowPath, err)
+ 	}
+ 	if err := stageAndPublishShadowWeChat(shadowPath, func(stagedPath string) error {
+ 		if out, err := combinedOutputAsInvokingUser("/bin/cp", "-R", wechatAppPath, stagedPath); err != nil {
+@@ -1220,42 +1271,44 @@
+ 		}
+ 		return nil
+ 	}); err != nil {
+-		return "", hadWeChatRunning, err
+-	}
+-	return shadowPath, hadWeChatRunning, nil
++		reopenOriginalWeChatIf(stoppedOriginal)
++		return "", false, err
++	}
++	return shadowPath, stoppedOriginal, nil
++}
++
++func reopenOriginalWeChatIf(stoppedOriginal bool) {
++	if !stoppedOriginal || envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
++		return
++	}
++	if processes, _, err := invokerWechatProcesses(); err != nil || len(processes) != 0 {
++		fmt.Fprintln(os.Stderr, "[wxkey] original WeChat was not reopened automatically because this user's process state is not clear")
++		return
++	}
++	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
++		fmt.Fprintf(os.Stderr, "[wxkey] could not reopen this user's original WeChat; open it manually: %v\n", err)
++	}
+ }
+ 
+ func waitForWeChatPIDUnderApp(appPath string, timeout time.Duration) (int, error) {
+ 	deadline := time.Now().Add(timeout)
+ 	for {
+-		pids, err := wechatPIDs()
++		processes, _, err := invokerWechatProcesses()
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		sort.Sort(sort.Reverse(sort.IntSlice(pids)))
+-		for _, pid := range pids {
+-			procPath, err := commandPathForPID(pid)
+-			if err != nil {
+-				continue
++		for _, process := range processes {
++			if process.Path == expectedWechatExecutable(appPath) {
++				fmt.Printf("[OK]   shadow WeChat PID: %d\n", process.PID)
++				return process.PID, nil
+ 			}
+-			if pathInsideApp(procPath, appPath) {
+-				fmt.Printf("[OK]   shadow WeChat PID: %d\n", pid)
+-				return pid, nil
+-			}
++			return 0, fmt.Errorf("another WeChat instance for this user is running at %s", process.Path)
+ 		}
+ 		if time.Now().After(deadline) {
+ 			return 0, fmt.Errorf("shadow WeChat did not start from %s; open WeChat, finish login, open one chat, then rerun `wxkey bootstrap`", appPath)
+ 		}
+ 		time.Sleep(2 * time.Second)
+ 	}
+-}
+-
+-func commandPathForPID(pid int) (string, error) {
+-	out, err := exec.Command("/bin/ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+-	if err != nil {
+-		return "", err
+-	}
+-	return strings.TrimSpace(string(out)), nil
+ }
+ 
+ func pathInsideApp(procPath, appPath string) bool {
+@@ -1271,18 +1324,24 @@
+ func ensureWeChatReady(root string, pid int, timeout time.Duration) error {
+ 	deadline := time.Now().Add(timeout)
+ 	if pid == 0 {
+-		if pids, _ := wechatPIDs(); len(pids) == 0 {
++		processes, _, err := invokerWechatProcesses()
++		if err != nil {
++			return err
++		}
++		if len(processes) == 0 {
+ 			fmt.Println("[INFO] Opening WeChat...")
+-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
+-		}
+-	} else if !pidAlive(pid) {
++			if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
++				return fmt.Errorf("open WeChat for this user: %w", err)
++			}
++		}
++	} else if !verifiedWechatProcessInSnapshotFromPID(pid) {
+ 		fmt.Println("[INFO] Opening WeChat...")
+-		_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++		return fmt.Errorf("WeChat PID %d is no longer verified for the invoking UID; refusing to open another instance", pid)
+ 	}
+ 	for {
+ 		readyPID := false
+ 		if pid > 0 {
+-			readyPID = pidAlive(pid)
++			readyPID = verifiedWechatProcessInSnapshotFromPID(pid)
+ 		} else if _, err := pickWeChatPID(); err == nil {
+ 			readyPID = true
+ 		}
+@@ -1300,6 +1359,11 @@
+ 		}
+ 		time.Sleep(2 * time.Second)
+ 	}
++}
++
++func verifiedWechatProcessInSnapshotFromPID(pid int) bool {
++	process, err := verifiedWechatPID(pid)
++	return err == nil && verifiedWechatProcessInSnapshot(process)
+ }
+ 
+ func pidAlive(pid int) bool {
+@@ -1467,6 +1531,9 @@
+ 		return nil, err
+ 	}
+ 	args := []string{"image-key", "--quiet"}
++	if f.config != "" {
++		args = append(args, "--config", f.config)
++	}
+ 	if f.pid > 0 {
+ 		args = append(args, "--pid", strconv.Itoa(f.pid))
+ 	}
+@@ -1510,9 +1577,10 @@
+ }
+ 
+ type pbkdfProbeTarget struct {
+-	AppPath string
+-	ExePath string
+-	Mode    string
++	AppPath         string
++	ExePath         string
++	Mode            string
++	StoppedOriginal bool
+ }
+ 
+ func runPBKDFProbeCaptured(f scanFlags, cfgPath string) (*setupOutput, error) {
+@@ -1534,9 +1602,18 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	hadWeChatRunning := stopWeChatForPBKDF(target.AppPath)
+-	if hadWeChatRunning {
+-		defer reopenOriginalWeChatAfterPBKDF()
++	if target.StoppedOriginal {
++		defer reopenOriginalWeChatIf(true)
++	}
++	if err := validatePBKDFProbeTarget(target); err != nil {
++		return nil, err
++	}
++	stopped, err := stopWeChatForPBKDF(target.AppPath)
++	if err != nil {
++		return nil, err
++	}
++	if stopped && filepath.Clean(target.AppPath) == filepath.Clean(wechatAppPath) && !target.StoppedOriginal {
++		defer reopenOriginalWeChatIf(true)
+ 	}
+ 	time.Sleep(1 * time.Second)
+ 
+@@ -1578,7 +1655,11 @@
+ 		commandTimeout = timeout + 15*time.Second
+ 	}
+ 	_, stderr, runErr := runChildCaptured(commandTimeout, "/usr/bin/env", args...)
+-	killWeChatProcessesUnderApp(target.AppPath, syscall.SIGKILL)
++	if cleanupErr := terminateWechatProcessesUnderApp(target.AppPath, syscall.SIGTERM); cleanupErr != nil {
++		if runErr == nil {
++			runErr = cleanupErr
++		}
++	}
+ 
+ 	probe, parseErr := readPBKDFProbeFile(outPath)
+ 	if parseErr != nil {
+@@ -1619,14 +1700,18 @@
+ 
+ func pbkdfProbeTargetForBootstrap() (pbkdfProbeTarget, error) {
+ 	if appPath := strings.TrimSpace(os.Getenv("WXKEY_PBKDF_WECHAT_APP")); appPath != "" {
+-		exePath := filepath.Join(appPath, "Contents", "MacOS", "WeChat")
++		appPath = filepath.Clean(appPath)
++		if appPath != filepath.Clean(wechatAppPath) && appPath != filepath.Clean(shadowWeChatPath()) {
++			return pbkdfProbeTarget{}, fmt.Errorf("custom PBKDF target must be this user's original or shadow WeChat app")
++		}
++		exePath := expectedWechatExecutable(appPath)
+ 		if _, err := os.Stat(exePath); err != nil {
+ 			return pbkdfProbeTarget{}, fmt.Errorf("PBKDF target executable not found under WXKEY_PBKDF_WECHAT_APP: %w", err)
+ 		}
+ 		return pbkdfProbeTarget{AppPath: appPath, ExePath: exePath, Mode: "custom"}, nil
+ 	}
+ 
+-	originalExe := filepath.Join(wechatAppPath, "Contents", "MacOS", "WeChat")
++	originalExe := expectedWechatExecutable(wechatAppPath)
+ 	sig := inspectWeChatSignature()
+ 	if sig.Err == nil && sig.AdHoc {
+ 		if _, err := os.Stat(originalExe); err != nil {
+@@ -1636,42 +1721,53 @@
+ 	}
+ 
+ 	shadowPath := shadowWeChatPath()
+-	shadowExe := filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
++	shadowExe := expectedWechatExecutable(shadowPath)
++	stoppedOriginal := false
+ 	if _, err := os.Stat(shadowExe); err != nil {
+ 		var prepErr error
+-		shadowPath, _, prepErr = prepareShadowWeChatCopy()
++		shadowPath, stoppedOriginal, prepErr = prepareShadowWeChatCopy()
+ 		if prepErr != nil {
+ 			return pbkdfProbeTarget{}, prepErr
+ 		}
+-		shadowExe = filepath.Join(shadowPath, "Contents", "MacOS", "WeChat")
+-	}
+-	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow"}, nil
+-}
+-
+-func stopWeChatForPBKDF(targetAppPath string) bool {
+-	pids, _ := wechatPIDs()
+-	if len(pids) == 0 {
+-		return false
+-	}
+-	fmt.Println("[INFO] Stopping existing WeChat before PBKDF fallback so LLDB owns the decrypting instance...")
+-	for _, pid := range pids {
+-		_ = syscall.Kill(pid, syscall.SIGTERM)
+-	}
+-	time.Sleep(2 * time.Second)
+-	killWeChatProcessesUnderApp(targetAppPath, syscall.SIGKILL)
+-	for _, pid := range pids {
+-		if pidAlive(pid) {
+-			_ = syscall.Kill(pid, syscall.SIGKILL)
+-		}
+-	}
+-	return true
+-}
+-
+-func reopenOriginalWeChatAfterPBKDF() {
+-	if envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+-		return
+-	}
+-	_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++		shadowExe = expectedWechatExecutable(shadowPath)
++	}
++	return pbkdfProbeTarget{AppPath: shadowPath, ExePath: shadowExe, Mode: "shadow", StoppedOriginal: stoppedOriginal}, nil
++}
++
++func validatePBKDFProbeTarget(target pbkdfProbeTarget) error {
++	appPath := filepath.Clean(target.AppPath)
++	if appPath != filepath.Clean(wechatAppPath) && appPath != filepath.Clean(shadowWeChatPath()) {
++		return fmt.Errorf("PBKDF target is outside this user's original and shadow WeChat apps")
++	}
++	if filepath.Clean(target.ExePath) != expectedWechatExecutable(appPath) {
++		return fmt.Errorf("PBKDF executable does not match the selected WeChat app")
++	}
++	if _, err := os.Stat(target.ExePath); err != nil {
++		return fmt.Errorf("PBKDF executable is unavailable: %w", err)
++	}
++	return nil
++}
++
++func stopWeChatForPBKDF(targetAppPath string) (bool, error) {
++	processes, err := verifiedWechatProcessesUnderApp(targetAppPath)
++	if err != nil {
++		return false, err
++	}
++	if len(processes) == 0 {
++		return false, nil
++	}
++	if len(processes) != 1 {
++		return false, fmt.Errorf("multiple WeChat processes are running for the invoking UID")
++	}
++	process := processes[0]
++	fmt.Println("[INFO] Stopping this user's WeChat before PBKDF fallback so LLDB owns the decrypting instance...")
++	if err := signalVerifiedWechatProcess(process, targetAppPath, syscall.SIGTERM); err != nil {
++		return false, err
++	}
++	if err := waitForWechatExit(process, targetAppPath, 3*time.Second); err != nil {
++		return false, err
++	}
++	return true, nil
+ }
+ 
+ func pbkdfProbeTimeout() time.Duration {
+@@ -1767,15 +1863,23 @@
+ 	return results
+ }
+ 
+-func killWeChatProcessesUnderApp(appPath string, sig syscall.Signal) {
+-	pids, _ := wechatPIDs()
+-	for _, pid := range pids {
+-		procPath, err := commandPathForPID(pid)
+-		if err != nil || !pathInsideApp(procPath, appPath) {
+-			continue
+-		}
+-		_ = syscall.Kill(pid, sig)
+-	}
++func terminateWechatProcessesUnderApp(appPath string, sig syscall.Signal) error {
++	if sig != syscall.SIGTERM {
++		return fmt.Errorf("wxkey permits only graceful SIGTERM for WeChat process cleanup")
++	}
++	processes, err := verifiedWechatProcessesUnderApp(appPath)
++	if err != nil {
++		return err
++	}
++	for _, process := range processes {
++		if err := signalVerifiedWechatProcess(process, appPath, sig); err != nil {
++			return err
++		}
++		if err := waitForWechatExit(process, appPath, 3*time.Second); err != nil {
++			return err
++		}
++	}
++	return nil
+ }
+ 
+ const pbkdfProbePython = `
+@@ -2030,22 +2134,15 @@
+ 	case err := <-done:
+ 		return stdout.Bytes(), stderr.String(), err
+ 	case <-timer.C:
+-		killProcessGroup(cmd.Process.Pid)
++		_ = cmd.Process.Signal(syscall.SIGTERM)
++		time.Sleep(750 * time.Millisecond)
++		_ = cmd.Process.Kill()
+ 		err := <-done
+ 		if err == nil {
+ 			err = fmt.Errorf("command exited after timeout")
+ 		}
+ 		return stdout.Bytes(), stderr.String(), fmt.Errorf("timed out after %s: %w", timeout.Round(time.Second), err)
+ 	}
+-}
+-
+-func killProcessGroup(pid int) {
+-	if pid <= 0 {
+-		return
+-	}
+-	_ = syscall.Kill(-pid, syscall.SIGTERM)
+-	time.Sleep(750 * time.Millisecond)
+-	_ = syscall.Kill(-pid, syscall.SIGKILL)
+ }
+ 
+ func writeImageKeyToConfig(path, key string, xorKey *int) error {
+@@ -2070,27 +2167,11 @@
+ }
+ 
+ func effectiveUserHome() string {
+-	// reExecElevated forwards the invoking user's HOME explicitly when it
+-	// spawns the elevated (root) child through Authorization Services. Trust that first —
+-	// stat /dev/console and SUDO_USER are both unreliable in non-sudo paths
+-	// (e.g. GUI prompts under fast user switching / locked screen /
+-	// headless sessions).
+-	if h := strings.TrimSpace(os.Getenv("WXKEY_ORIG_HOME")); h != "" {
+-		return h
+-	}
+-	if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
+-		return filepath.Join("/Users", u)
+-	}
+-	if os.Geteuid() == 0 {
+-		if out, err := exec.Command("/usr/bin/stat", "-f", "%Su", "/dev/console").Output(); err == nil {
+-			u := strings.TrimSpace(string(out))
+-			if u != "" && u != "root" && u != "loginwindow" {
+-				return filepath.Join("/Users", u)
+-			}
+-		}
+-	}
+-	home, _ := os.UserHomeDir()
+-	return home
++	identity, err := invokingIdentity()
++	if err != nil {
++		return ""
++	}
++	return identity.Home
+ }
+ 
+ func wechatPIDs() ([]int, error) {
+@@ -2116,21 +2197,14 @@
+ }
+ 
+ func pickWeChatPID() (int, error) {
+-	pids, err := wechatPIDs()
++	processes, _, err := invokerWechatProcesses()
+ 	if err != nil {
+ 		return 0, err
+ 	}
+-	if len(pids) == 0 {
+-		return 0, fmt.Errorf("WeChat process not running")
+-	}
+-	// pick highest pid (most recent main process)
+-	max := pids[0]
+-	for _, p := range pids[1:] {
+-		if p > max {
+-			max = p
+-		}
+-	}
+-	return max, nil
++	if len(processes) == 0 {
++		return 0, fmt.Errorf("WeChat process not running for the invoking UID")
++	}
++	return processes[0].PID, nil
+ }
+ 
+ // pickAccountRoot finds an active WeChat account directory under one of the
+@@ -2231,6 +2305,7 @@
+ 
+ func fail(format string, args ...any) {
+ 	fmt.Fprintf(os.Stderr, "[wxkey] ERROR: "+format+"\n", args...)
++	runFailureCleanups()
+ 	os.Exit(1)
+ }
+ 
+@@ -2404,20 +2479,11 @@
+ }
+ 
+ func invokingUserCommandEnv(env []string) []string {
+-	home := effectiveUserHome()
+-	user := strings.TrimSpace(os.Getenv("WXKEY_ORIG_USER"))
+-	if user == "" {
+-		if uid, _, ok := invokingUserIDs(); ok {
+-			if owner, err := userpkg.LookupId(strconv.Itoa(uid)); err == nil {
+-				user = owner.Username
+-			}
+-		}
+-	}
+-	values := map[string]string{"HOME": home}
+-	if user != "" {
+-		values["USER"] = user
+-		values["LOGNAME"] = user
+-	}
++	identity, err := invokingIdentity()
++	if err != nil {
++		return nil
++	}
++	values := map[string]string{"HOME": identity.Home, "USER": identity.Username, "LOGNAME": identity.Username}
+ 	out := make([]string, 0, len(env)+len(values))
+ 	seen := map[string]bool{}
+ 	for _, item := range env {
+@@ -2425,6 +2491,9 @@
+ 		if !ok {
+ 			continue
+ 		}
++		if key == invocationFileEnv || key == "WXKEY_ORIG_HOME" || key == "WXKEY_ORIG_USER" || key == "WXKEY_ELEVATED" {
++			continue
++		}
+ 		if value, replace := values[key]; replace {
+ 			out = append(out, key+"="+value)
+ 			seen[key] = true
+@@ -2442,7 +2511,7 @@
+ 
+ func printPermissionAdvice(quiet bool, original error) {
+ 	if quiet {
+-		fmt.Fprintln(os.Stderr, "wxkey: task_for_pid denied. Run `wxkey doctor` for details or `wxkey resign-wechat` to use the no-SIP setup route.")
++		fmt.Fprintln(os.Stderr, "wxkey: task_for_pid denied. Run `wxkey doctor` for details or `wxkey bootstrap` to prepare this user's isolated shadow route.")
+ 		return
+ 	}
+ 
+@@ -2471,10 +2540,7 @@
+ 	} else if sig.AdHoc {
+ 		fmt.Fprintln(os.Stderr, "       WeChat 签名: ad-hoc, 已是推荐状态. 请跑 `wxkey bootstrap` 并在 macOS 系统认证框授权")
+ 	} else if sig.Runtime {
+-		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 推荐执行一次:")
+-		fmt.Fprintln(os.Stderr, "         ./wxkey resign-wechat")
+-		fmt.Fprintln(os.Stderr, "       然后等 WeChat 完全登录并打开一个聊天, 再跑:")
+-		fmt.Fprintln(os.Stderr, "         wxkey setup")
++		fmt.Fprintln(os.Stderr, "       WeChat 签名: 官方 Hardened Runtime. 推荐执行 wxkey bootstrap 准备当前用户的 shadow 副本。")
+ 	} else {
+ 		fmt.Fprintln(os.Stderr, "       WeChat 签名: 未识别. 可先跑 `wxkey doctor` 查看详情.")
+ 	}
+@@ -2507,28 +2573,21 @@
+ // reExecElevated re-launches this binary through fixed JXA using
+ // macOS Authorization Services, blocks until it exits, and forwards command
+ // stdout/stderr. Credential entry is handled only by the macOS system dialog;
+-// wxkey never receives password input or output. It also
+-// forwards the invoking user's HOME and USER so the elevated (root) child
+-// can locate `~/Library/Containers/com.tencent.xinWeChat/...` belonging to
+-// the desktop user — `stat /dev/console` alone is unreliable (e.g. fast
+-// user switching, screen locked, headless sessions all break it).
++// wxkey never receives password input or output. Before authorization, the
++// unprivileged process creates a short-lived owner-verified UID/home record;
++// the elevated process uses it instead of trusting caller-controlled identity
++// environment variables. The parent removes the record after the child exits.
+ func reExecElevated() error {
+ 	exe, err := os.Executable()
+ 	if err != nil {
+ 		return err
+ 	}
+-	origHome, _ := os.UserHomeDir()
+-	origUser := os.Getenv("USER")
+-	if origUser == "" {
+-		if cu, err := userpkg.Current(); err == nil {
+-			origUser = cu.Username
+-		}
+-	}
+-	args := []string{"/usr/bin/env",
+-		"WXKEY_ELEVATED=1",
+-		"WXKEY_ORIG_HOME=" + origHome,
+-		"WXKEY_ORIG_USER=" + origUser,
+-	}
++	identityFile, cleanupIdentity, err := createInvocationIdentityFile()
++	if err != nil {
++		return fmt.Errorf("create protected invoking-user record: %w", err)
++	}
++	defer cleanupIdentity()
++	args := []string{"/usr/bin/env", invocationFileEnv + "=" + identityFile}
+ 	for _, name := range []string{"WXKEY_SETUP_TIMEOUT", "WXKEY_SCAN_TIMEOUT", "WXKEY_BOOTSTRAP_SCAN_TIMEOUT", "WXKEY_PBKDF_PROBE_TIMEOUT", "WXKEY_PBKDF_EARLY_STOP"} {
+ 		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+ 			args = append(args, name+"="+value)
+@@ -2561,71 +2620,7 @@
+ }
+ 
+ func runResignWeChat() {
+-	if os.Geteuid() != 0 && !envTrue("WXKEY_NO_ELEVATE") && !envTrue("WXKEY_ELEVATED") {
+-		fmt.Fprintln(os.Stderr, "[wxkey] requesting macOS administrator authorization for resign-wechat...")
+-		if err := reExecElevated(); err != nil {
+-			fail("re-elevate resign-wechat: %v", err)
+-		}
+-		return
+-	}
+-	if os.Geteuid() != 0 {
+-		fail("resign-wechat requires administrator privileges; rerun and approve the macOS system administrator dialog")
+-	}
+-
+-	fmt.Println("=== wxkey resign-wechat ===")
+-	if _, err := os.Stat(wechatAppPath); err != nil {
+-		fail("WeChat app not found at %s: %v", wechatAppPath, err)
+-	}
+-
+-	fmt.Println("[1/4] Quitting WeChat if it is running...")
+-	_ = exec.Command("/usr/bin/killall", "WeChat").Run()
+-	time.Sleep(2 * time.Second)
+-
+-	fmt.Println("[2/4] Ad-hoc signing /Applications/WeChat.app...")
+-	out, err := runCodesignWeChat()
+-	if err != nil && strings.Contains(string(out), "signature in use") {
+-		plugin := filepath.Join(wechatAppPath, "Contents", "Frameworks", "vlc_plugins", "librtp_mpeg4_plugin.dylib")
+-		if _, statErr := os.Stat(plugin); statErr == nil {
+-			fmt.Println("      codesign reported signature in use; removing nested plugin signature and retrying...")
+-			rmOut, rmErr := exec.Command("/usr/bin/codesign", "--remove-signature", plugin).CombinedOutput()
+-			if rmErr != nil {
+-				fail("remove nested signature failed: %v\n%s", rmErr, strings.TrimSpace(string(rmOut)))
+-			}
+-			out, err = runCodesignWeChat()
+-		}
+-	}
+-	if err != nil {
+-		fail("codesign WeChat failed: %v\n%s", err, strings.TrimSpace(string(out)))
+-	}
+-
+-	fmt.Println("[3/4] Verifying signature state...")
+-	sig := inspectWeChatSignature()
+-	if sig.Err != nil {
+-		fail("inspect WeChat signature after resign failed: %v\n%s", sig.Err, sig.Raw)
+-	}
+-	if !sig.AdHoc {
+-		fail("WeChat signature is still not ad-hoc after codesign:\n%s", sig.Raw)
+-	}
+-	fmt.Println("      WeChat signature is ad-hoc.")
+-
+-	fmt.Println("[4/4] Reopening WeChat...")
+-	if err := exec.Command("/usr/bin/open", wechatAppPath).Run(); err != nil {
+-		fmt.Fprintf(os.Stderr, "[WARN] open WeChat failed: %v\n", err)
+-		fmt.Fprintln(os.Stderr, "       Ask the user to open WeChat manually and wait for login; then the agent should run `wxkey setup`.")
+-		return
+-	}
+-
+-	fmt.Println("")
+-	fmt.Println("Done. After WeChat is fully logged in and you have opened at least one chat, run:")
+-	fmt.Println("  wxkey setup")
+-}
+-
+-func runCodesignWeChat() ([]byte, error) {
+-	if os.Geteuid() == 0 {
+-		return exec.Command("/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath).CombinedOutput()
+-	}
+-	cmd := administratorCommand("/usr/bin/codesign", "--force", "--deep", "--sign", "-", wechatAppPath)
+-	return cmd.CombinedOutput()
++	fail("resign-wechat is disabled because /Applications/WeChat.app is shared across macOS users; use `wxkey bootstrap` to prepare this user's isolated shadow copy")
+ }
+ 
+ // startOrphanWatchdog runs only in elevated children spawned through macOS
+@@ -2635,7 +2630,10 @@
+ // it keeps holding task_for_pid + scanning, can't be killed by the user, and
+ // blocks every subsequent setup invocation.
+ func startOrphanWatchdog() {
+-	if os.Getenv("WXKEY_ELEVATED") != "1" {
++	if os.Geteuid() != 0 {
++		return
++	}
++	if _, err := invokingIdentity(); err != nil {
+ 		return
+ 	}
+ 	go func() {
+@@ -2666,7 +2664,7 @@
+ 
+ 	if disabled, raw := sipDisabled(); !disabled && raw != "" {
+ 		logf("[INFO] SIP 已启用: %s\n", raw)
+-		logf("       这不是硬性失败; 推荐路线是 ad-hoc 重签 WeChat 后用管理员权限取 key.\n")
++		logf("       这不是硬性失败; 推荐路线是为当前用户创建 ad-hoc shadow 后用管理员权限取 key.\n")
+ 	} else if disabled {
+ 		logf("[OK]   SIP 已关闭\n")
+ 	} else {
+@@ -2691,19 +2689,22 @@
+ 		}
+ 	}
+ 
+-	pids, _ := wechatPIDs()
+-	if len(pids) == 0 {
++	processes, _, processErr := invokerWechatProcesses()
++	if processErr != nil {
++		logf("[FAIL] WeChat process ownership is ambiguous: %v\n", processErr)
++		os.Exit(1)
++	}
++	if len(processes) == 0 {
+ 		logf("[FAIL] WeChat 进程未在运行\n")
+ 		logf("       请先启动 WeChat 并登录账号，再重跑 doctor\n")
+ 		os.Exit(1)
+ 	}
+-	pid := pids[0]
+-	for _, p := range pids[1:] {
+-		if p > pid {
+-			pid = p
+-		}
+-	}
++	pid := processes[0].PID
+ 	if f.pid > 0 {
++		if _, err := verifiedWechatPID(f.pid); err != nil {
++			logf("[FAIL] Refusing requested WeChat PID: %v\n", err)
++			os.Exit(1)
++		}
+ 		pid = f.pid
+ 	}
+ 	logf("[OK]   WeChat 进程: PID %d\n", pid)
+diff --git a/cmd/wxkey/main_test.go b/cmd/wxkey/main_test.go
+--- a/cmd/wxkey/main_test.go
++++ b/cmd/wxkey/main_test.go
+@@ -9,8 +9,10 @@
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	userpkg "os/user"
+ 	"path/filepath"
+ 	"runtime"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -49,7 +51,7 @@
+ }
+ 
+ func TestAdministratorCommandUsesFixedJXAAndNoStdin(t *testing.T) {
+-	args := []string{"/usr/bin/env", "WXKEY_ELEVATED=1", "/tmp/wx key", "scan", "a'; touch /tmp/nope; echo '"}
++	args := []string{"/usr/bin/env", "WXKEY_INVOCATION_FILE=/tmp/wxkey-invocation-safe/identity.json", "/tmp/wx key", "scan", "a'; touch /tmp/nope; echo '"}
+ 	cmd := administratorCommand(args...)
+ 	if cmd.Path != "/usr/bin/osascript" {
+ 		t.Fatalf("administrator command path = %q, want /usr/bin/osascript", cmd.Path)
+@@ -229,7 +231,7 @@
+ func TestSafeRemoveShadowWeChatStaysInManagedDirectory(t *testing.T) {
+ 	home := t.TempDir()
+ 	t.Setenv("WXKEY_ORIG_HOME", home)
+-	managed := filepath.Join(home, "Library", "Application Support", "wx-mcp", "WeChat-test.app")
++	managed := filepath.Join(filepath.Dir(defaultConfigPath()), "Library", "Application Support", "wx-mcp", "WeChat-test.app")
+ 	if _, _, _, err := validateShadowWeChatPath(managed); err != nil {
+ 		t.Fatalf("managed shadow path rejected: %v", err)
+ 	}
+@@ -264,7 +266,7 @@
+ func TestSafeRemoveShadowWeChatRejectsSymlink(t *testing.T) {
+ 	home := t.TempDir()
+ 	t.Setenv("WXKEY_ORIG_HOME", home)
+-	root := filepath.Join(home, "Library", "Application Support", "wx-mcp")
++	root := filepath.Dir(shadowWeChatPath())
+ 	if err := os.MkdirAll(root, 0o700); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -291,7 +293,7 @@
+ func TestSafeRemoveShadowWeChatRejectsManagedParentSymlink(t *testing.T) {
+ 	home := t.TempDir()
+ 	t.Setenv("WXKEY_ORIG_HOME", home)
+-	appSupport := filepath.Join(home, "Library", "Application Support")
++	appSupport := filepath.Join(filepath.Dir(defaultConfigPath()), "Library", "Application Support")
+ 	if err := os.MkdirAll(appSupport, 0o700); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -320,6 +322,10 @@
+ 	home := t.TempDir()
+ 	t.Setenv("WXKEY_ORIG_HOME", home)
+ 	t.Setenv("WXKEY_ORIG_USER", "alice")
++	entry, err := userpkg.LookupId(strconv.Itoa(os.Getuid()))
++	if err != nil {
++		t.Fatal(err)
++	}
+ 	env := invokingUserCommandEnv([]string{"HOME=/var/root", "USER=root", "LOGNAME=root", "KEEP=yes"})
+ 	values := map[string]string{}
+ 	for _, item := range env {
+@@ -328,15 +334,18 @@
+ 			values[key] = value
+ 		}
+ 	}
+-	if values["HOME"] != home || values["USER"] != "alice" || values["LOGNAME"] != "alice" || values["KEEP"] != "yes" {
++	if values["HOME"] != home || values["USER"] != entry.Username || values["LOGNAME"] != entry.Username || values["KEEP"] != "yes" {
+ 		t.Fatalf("invoking user env = %#v", values)
+ 	}
++	if _, exists := values["WXKEY_ORIG_USER"]; exists {
++		t.Fatal("unverified WXKEY_ORIG_USER was forwarded")
++	}
+ }
+ 
+ func TestStageAndPublishShadowWeChatReplacesFinalSymlink(t *testing.T) {
+ 	home := t.TempDir()
+ 	t.Setenv("WXKEY_ORIG_HOME", home)
+-	shadow := filepath.Join(home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	shadow := shadowWeChatPath()
+ 	if err := safeRemoveShadowWeChat(shadow); err != nil {
+ 		t.Fatalf("prepare managed shadow directory: %v", err)
+ 	}
+@@ -387,7 +396,9 @@
+ }
+ 
+ func TestPBKDFProbeTargetSupportsExplicitApp(t *testing.T) {
+-	app := filepath.Join(t.TempDir(), "WeChat-test.app")
++	home := t.TempDir()
++	t.Setenv("WXKEY_ORIG_HOME", home)
++	app := shadowWeChatPath()
+ 	exe := filepath.Join(app, "Contents", "MacOS", "WeChat")
+ 	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+ 		t.Fatal(err)
+@@ -403,6 +414,13 @@
+ 	}
+ 	if target.AppPath != app || target.ExePath != exe || target.Mode != "custom" {
+ 		t.Fatalf("target = %#v, want custom app/exe", target)
++	}
++}
++
++func TestPBKDFProbeTargetRejectsUnrelatedApp(t *testing.T) {
++	t.Setenv("WXKEY_PBKDF_WECHAT_APP", filepath.Join(t.TempDir(), "other.app"))
++	if _, err := pbkdfProbeTargetForBootstrap(); err == nil {
++		t.Fatal("unrelated custom PBKDF app was accepted")
+ 	}
+ }
+ 
+diff --git a/cmd/wxkey/process_scope.go b/cmd/wxkey/process_scope.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/wxkey/process_scope.go
+@@ -0,0 +1,442 @@
++package main
++
++import (
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"os"
++	userpkg "os/user"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++	"unsafe"
++
++	"github.com/ebitengine/purego"
++)
++
++const invocationFileEnv = "WXKEY_INVOCATION_FILE"
++
++var failureCleanupMu sync.Mutex
++var failureCleanups []func()
++
++func registerFailureCleanup(cleanup func()) func() {
++	var once sync.Once
++	guarded := func() { once.Do(cleanup) }
++	failureCleanupMu.Lock()
++	failureCleanups = append(failureCleanups, guarded)
++	failureCleanupMu.Unlock()
++	return guarded
++}
++
++func runFailureCleanups() {
++	failureCleanupMu.Lock()
++	cleanups := append([]func(){}, failureCleanups...)
++	failureCleanups = nil
++	failureCleanupMu.Unlock()
++	for i := len(cleanups) - 1; i >= 0; i-- {
++		cleanups[i]()
++	}
++}
++
++type invocationIdentityRecord struct {
++	UID        int    `json:"uid"`
++	Username   string `json:"username"`
++	Home       string `json:"home"`
++	ConfigPath string `json:"configPath"`
++}
++
++type invocationIdentity struct {
++	UID        int
++	Username   string
++	Home       string
++	ConfigPath string
++}
++
++type wechatProcess struct {
++	PID   int
++	UID   int
++	RUID  int
++	Path  string
++	Start string
++}
++
++type procPIDInfoFunc func(pid int32, flavor int32, arg uint64, buffer unsafe.Pointer, bufferSize int32) int32
++type procPIDPathFunc func(pid int32, buffer unsafe.Pointer, bufferSize uint32) int32
++
++var procInfoOnce sync.Once
++var procPIDInfo procPIDInfoFunc
++var procPIDPath procPIDPathFunc
++var procInfoErr error
++
++func loadProcInfoFunctions() {
++	procInfoOnce.Do(func() {
++		lib, err := purego.Dlopen("/usr/lib/libproc.dylib", purego.RTLD_NOW|purego.RTLD_GLOBAL)
++		if err != nil {
++			procInfoErr = fmt.Errorf("load macOS libproc: %w", err)
++			return
++		}
++		purego.RegisterLibFunc(&procPIDInfo, lib, "proc_pidinfo")
++		purego.RegisterLibFunc(&procPIDPath, lib, "proc_pidpath")
++	})
++}
++
++func invokingIdentity() (invocationIdentity, error) {
++	if os.Geteuid() == 0 {
++		path := strings.TrimSpace(os.Getenv(invocationFileEnv))
++		if path == "" {
++			return invocationIdentity{}, fmt.Errorf("elevated wxkey has no verified invoking-user record")
++		}
++		return readInvocationIdentity(path)
++	}
++	if os.Geteuid() != os.Getuid() {
++		return invocationIdentity{}, fmt.Errorf("wxkey refuses an unexpected setuid identity")
++	}
++	entry, err := userpkg.LookupId(strconv.Itoa(os.Getuid()))
++	if err != nil {
++		return invocationIdentity{}, fmt.Errorf("resolve current user: %w", err)
++	}
++	home := entry.HomeDir
++	if override := strings.TrimSpace(os.Getenv("WXKEY_ORIG_HOME")); override != "" {
++		home = override
++	}
++	home, err = validateIdentityHome(home, os.Getuid())
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	configPath := commandConfigPath
++	if configPath == "" {
++		configPath = filepath.Join(home, ".config", "wxcli", "config.json")
++	}
++	configPath, err = validateInvocationConfig(configPath, home)
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	return invocationIdentity{UID: os.Getuid(), Username: entry.Username, Home: home, ConfigPath: configPath}, nil
++}
++
++func validateIdentityRecord(record invocationIdentityRecord, ownerUID int, lookup func(string) (*userpkg.User, error)) (invocationIdentity, error) {
++	if record.UID != ownerUID || ownerUID <= 0 {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record UID does not match its file owner")
++	}
++	entry, err := lookup(strconv.Itoa(ownerUID))
++	if err != nil {
++		return invocationIdentity{}, fmt.Errorf("resolve invoking user: %w", err)
++	}
++	if record.Username != entry.Username {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record username does not match its UID")
++	}
++	home, err := filepath.Abs(filepath.Clean(record.Home))
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	home, err = validateIdentityHome(home, ownerUID)
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	configPath, err := validateInvocationConfig(record.ConfigPath, home)
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	return invocationIdentity{UID: ownerUID, Username: entry.Username, Home: home, ConfigPath: configPath}, nil
++}
++
++// The selected config is the sole owner of bootstrap storage, including after
++// elevation. Its path must remain inside the verified user's home without links.
++func validateInvocationConfig(path, home string) (string, error) {
++	if !filepath.IsAbs(path) {
++		return "", fmt.Errorf("invoking command config must be absolute")
++	}
++	clean := filepath.Clean(path)
++	rel, err := filepath.Rel(home, clean)
++	if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
++		return "", fmt.Errorf("invoking command config escapes invoking user's home")
++	}
++	root, err := os.OpenRoot(home)
++	if err != nil {
++		return "", err
++	}
++	defer root.Close()
++	if err := rejectRootSymlinkComponents(root, rel, true); err != nil {
++		return "", fmt.Errorf("unsafe invoking command config: %w", err)
++	}
++	return clean, nil
++}
++
++func validateIdentityHome(home string, uid int) (string, error) {
++	abs, err := filepath.Abs(filepath.Clean(home))
++	if err != nil || abs == string(os.PathSeparator) {
++		return "", fmt.Errorf("invalid invoking-user home")
++	}
++	info, err := os.Stat(abs)
++	if err != nil || !info.IsDir() {
++		return "", fmt.Errorf("invoking-user home is not an accessible directory")
++	}
++	st, ok := info.Sys().(*syscall.Stat_t)
++	if !ok || int(st.Uid) != uid {
++		return "", fmt.Errorf("invoking-user home is not owned by the invoking UID")
++	}
++	return abs, nil
++}
++
++func createInvocationIdentityFile() (string, func(), error) {
++	if os.Geteuid() == 0 || os.Geteuid() != os.Getuid() {
++		return "", nil, fmt.Errorf("cannot create an invoking-user record from this process identity")
++	}
++	identity, err := invokingIdentity()
++	if err != nil {
++		return "", nil, err
++	}
++	entry, err := userpkg.LookupId(strconv.Itoa(identity.UID))
++	if err != nil {
++		return "", nil, fmt.Errorf("resolve current user: %w", err)
++	}
++	dir, err := os.MkdirTemp("", "wxkey-invocation-")
++	if err != nil {
++		return "", nil, err
++	}
++	cleanup := func() { _ = os.RemoveAll(dir) }
++	if err := os.Chmod(dir, 0o700); err != nil {
++		cleanup()
++		return "", nil, err
++	}
++	path := filepath.Join(dir, "identity.json")
++	data, err := json.Marshal(invocationIdentityRecord{UID: identity.UID, Username: entry.Username, Home: identity.Home, ConfigPath: identity.ConfigPath})
++	if err != nil {
++		cleanup()
++		return "", nil, err
++	}
++	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
++		cleanup()
++		return "", nil, err
++	}
++	return path, cleanup, nil
++}
++
++func readInvocationIdentity(path string) (invocationIdentity, error) {
++	path, err := filepath.Abs(filepath.Clean(path))
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	dir := filepath.Dir(path)
++	dirInfo, err := os.Lstat(dir)
++	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record directory is missing or unsafe")
++	}
++	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
++	if !ok || dirInfo.Mode().Perm() != 0o700 {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record directory permissions are unsafe")
++	}
++	fileInfo, err := os.Lstat(path)
++	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode().Perm() != 0o600 {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record file is missing or unsafe")
++	}
++	fileStat, ok := fileInfo.Sys().(*syscall.Stat_t)
++	if !ok || fileStat.Uid != dirStat.Uid {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record ownership is inconsistent")
++	}
++	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
++	if err != nil {
++		return invocationIdentity{}, err
++	}
++	f := os.NewFile(uintptr(fd), path)
++	defer f.Close()
++	opened, err := f.Stat()
++	if err != nil || !os.SameFile(fileInfo, opened) {
++		return invocationIdentity{}, fmt.Errorf("invoking-user record changed while opening")
++	}
++	var record invocationIdentityRecord
++	if err := json.NewDecoder(f).Decode(&record); err != nil {
++		return invocationIdentity{}, fmt.Errorf("parse invoking-user record: %w", err)
++	}
++	return validateIdentityRecord(record, int(fileStat.Uid), userpkg.LookupId)
++}
++
++func processSnapshot(pid int) (wechatProcess, error) {
++	if pid <= 0 {
++		return wechatProcess{}, fmt.Errorf("invalid WeChat PID")
++	}
++	loadProcInfoFunctions()
++	if procInfoErr != nil {
++		return wechatProcess{}, procInfoErr
++	}
++	const procPIDBSDInfo = 3
++	const procBSDInfoSize = 136
++	var info [procBSDInfoSize]byte
++	n := procPIDInfo(int32(pid), procPIDBSDInfo, 0, unsafe.Pointer(&info[0]), int32(len(info)))
++	if n != procBSDInfoSize || int(binary.LittleEndian.Uint32(info[12:16])) != pid {
++		return wechatProcess{}, fmt.Errorf("libproc could not verify WeChat PID %d", pid)
++	}
++	euid := int(binary.LittleEndian.Uint32(info[20:24]))
++	realUID := int(binary.LittleEndian.Uint32(info[28:32]))
++	start := fmt.Sprintf("%d.%06d", binary.LittleEndian.Uint64(info[120:128]), binary.LittleEndian.Uint64(info[128:136]))
++	var pathBuffer [4096]byte
++	pathLen := procPIDPath(int32(pid), unsafe.Pointer(&pathBuffer[0]), uint32(len(pathBuffer)))
++	if pathLen <= 0 || int(pathLen) >= len(pathBuffer) {
++		return wechatProcess{}, fmt.Errorf("libproc could not resolve executable path for WeChat PID %d", pid)
++	}
++	path := filepath.Clean(strings.TrimRight(string(pathBuffer[:pathLen]), "\x00"))
++	if !filepath.IsAbs(path) || path == "." || start == "0.000000" {
++		return wechatProcess{}, fmt.Errorf("WeChat PID %d has an unknown executable path or start time", pid)
++	}
++	return wechatProcess{PID: pid, UID: euid, RUID: realUID, Path: path, Start: start}, nil
++}
++
++func invokerWechatProcesses() ([]wechatProcess, invocationIdentity, error) {
++	identity, err := invokingIdentity()
++	if err != nil {
++		return nil, invocationIdentity{}, err
++	}
++	pids, err := wechatPIDs()
++	if err != nil {
++		return nil, invocationIdentity{}, fmt.Errorf("enumerate WeChat processes: %w", err)
++	}
++	processes := make([]wechatProcess, 0, len(pids))
++	for _, pid := range pids {
++		process, err := processSnapshot(pid)
++		if err != nil {
++			if !pidAlive(pid) {
++				continue
++			}
++			return nil, invocationIdentity{}, fmt.Errorf("cannot establish identity of WeChat PID %d: %w", pid, err)
++		}
++		processes = append(processes, process)
++	}
++	shadow, _, _, err := validateShadowWeChatPath(shadowWeChatPath())
++	if err != nil {
++		return nil, invocationIdentity{}, err
++	}
++	shadow = filepath.Clean(shadow)
++	processes, err = scopeWechatProcesses(processes, identity, wechatAppPath, shadow)
++	if err != nil {
++		return nil, invocationIdentity{}, err
++	}
++	return processes, identity, nil
++}
++
++func verifiedWechatPID(pid int) (wechatProcess, error) {
++	processes, _, err := invokerWechatProcesses()
++	if err != nil {
++		return wechatProcess{}, err
++	}
++	for _, process := range processes {
++		if process.PID == pid {
++			return process, nil
++		}
++	}
++	return wechatProcess{}, fmt.Errorf("WeChat PID %d is not a verified process for the invoking UID", pid)
++}
++
++func verifiedWechatProcessesUnderApp(appPath string) ([]wechatProcess, error) {
++	processes, _, err := invokerWechatProcesses()
++	if err != nil {
++		return nil, err
++	}
++	expected := expectedWechatExecutable(appPath)
++	filtered := make([]wechatProcess, 0, len(processes))
++	for _, process := range processes {
++		if process.Path == expected {
++			filtered = append(filtered, process)
++		} else {
++			return nil, fmt.Errorf("WeChat PID %d is running outside the selected app %s", process.PID, appPath)
++		}
++	}
++	return filtered, nil
++}
++
++func verifiedWechatProcessInSnapshot(process wechatProcess) bool {
++	current, err := processSnapshot(process.PID)
++	if err != nil || !sameProcessIdentity(process, current) {
++		return false
++	}
++	identity, err := invokingIdentity()
++	if err != nil || current.UID != identity.UID || current.RUID != identity.UID {
++		return false
++	}
++	return current.Path == expectedWechatExecutable(wechatAppPath) || current.Path == expectedWechatExecutable(shadowWeChatPath())
++}
++
++func expectedWechatExecutable(appPath string) string {
++	return filepath.Clean(filepath.Join(appPath, "Contents", "MacOS", "WeChat"))
++}
++
++func scopeWechatProcesses(processes []wechatProcess, identity invocationIdentity, originalApp, shadowApp string) ([]wechatProcess, error) {
++	var own []wechatProcess
++	originalExe := expectedWechatExecutable(originalApp)
++	shadowExe := expectedWechatExecutable(shadowApp)
++	for _, process := range processes {
++		if process.UID != identity.UID || process.RUID != identity.UID {
++			if process.UID == identity.UID || process.RUID == identity.UID {
++				return nil, fmt.Errorf("WeChat PID %d has mismatched real/effective UID; refusing process control", process.PID)
++			}
++			if pathInsideApp(process.Path, shadowApp) {
++				return nil, fmt.Errorf("another UID is using this user's shadow WeChat path; refusing to replace it")
++			}
++			continue
++		}
++		if process.Path != originalExe && process.Path != shadowExe {
++			return nil, fmt.Errorf("WeChat PID %d has an unrecognized executable path; refusing process control", process.PID)
++		}
++		own = append(own, process)
++	}
++	if len(own) > 1 {
++		return nil, fmt.Errorf("multiple WeChat processes belong to UID %d; close the extra instance and retry", identity.UID)
++	}
++	return own, nil
++}
++
++func sameProcessIdentity(before, current wechatProcess) bool {
++	return before.PID == current.PID && before.UID == current.UID && before.RUID == current.RUID && before.Path == current.Path && before.Start == current.Start
++}
++
++func validateProcessForSignal(before, current wechatProcess, identity invocationIdentity, targetApp string) error {
++	if before.UID != identity.UID || before.RUID != identity.UID {
++		return fmt.Errorf("refusing to signal a WeChat process outside the invoking UID")
++	}
++	if !sameProcessIdentity(before, current) {
++		return fmt.Errorf("WeChat PID %d changed identity or executable path; refusing to signal it", before.PID)
++	}
++	if current.Path != expectedWechatExecutable(targetApp) {
++		return fmt.Errorf("WeChat PID %d is outside the selected app; refusing to signal it", current.PID)
++	}
++	return nil
++}
++
++func signalVerifiedWechatProcess(process wechatProcess, targetApp string, sig syscall.Signal) error {
++	identity, err := invokingIdentity()
++	if err != nil {
++		return err
++	}
++	current, err := processSnapshot(process.PID)
++	if err != nil {
++		return fmt.Errorf("recheck WeChat PID %d before signal: %w", process.PID, err)
++	}
++	if err := validateProcessForSignal(process, current, identity, targetApp); err != nil {
++		return err
++	}
++	return syscall.Kill(process.PID, sig)
++}
++
++func waitForWechatExit(process wechatProcess, targetApp string, timeout time.Duration) error {
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		current, err := processSnapshot(process.PID)
++		if err != nil {
++			if !pidAlive(process.PID) {
++				return nil
++			}
++			return fmt.Errorf("cannot verify WeChat PID %d while waiting for exit: %w", process.PID, err)
++		}
++		identity, idErr := invokingIdentity()
++		if idErr != nil {
++			return idErr
++		}
++		if err := validateProcessForSignal(process, current, identity, targetApp); err != nil {
++			return err
++		}
++		time.Sleep(200 * time.Millisecond)
++	}
++	return fmt.Errorf("WeChat PID %d did not exit after SIGTERM; refusing to force-kill it", process.PID)
++}
+diff --git a/cmd/wxkey/process_scope_test.go b/cmd/wxkey/process_scope_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/wxkey/process_scope_test.go
+@@ -0,0 +1,227 @@
++package main
++
++import (
++	"os"
++	userpkg "os/user"
++	"path/filepath"
++	"strconv"
++	"syscall"
++	"testing"
++)
++
++func TestScopeWechatProcessesIgnoresOtherUsersOriginalInstance(t *testing.T) {
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	original := "/Applications/WeChat.app"
++	shadow := "/Users/fixture-user/Library/Application Support/wx-mcp/WeChat-shadow.app"
++	processes := []wechatProcess{
++		{PID: 10, UID: 501, RUID: 501, Path: expectedWechatExecutable(original), Start: "other-user-start"},
++		{PID: 20, UID: 502, RUID: 502, Path: expectedWechatExecutable(shadow), Start: "fixture-user-start"},
++	}
++
++	got, err := scopeWechatProcesses(processes, identity, original, shadow)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 1 || got[0].PID != 20 {
++		t.Fatalf("scoped processes = %#v, want only worka PID 20", got)
++	}
++}
++
++func TestElevatedIdentityIsBoundToRecordOwner(t *testing.T) {
++	if os.Getuid() == 0 {
++		t.Skip("requires an unprivileged test user")
++	}
++	entry, err := userpkg.LookupId(strconv.Itoa(os.Getuid()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	record := invocationIdentityRecord{UID: os.Getuid(), Username: entry.Username, Home: entry.HomeDir, ConfigPath: filepath.Join(entry.HomeDir, ".config", "wxcli", "config.json")}
++	identity, err := validateIdentityRecord(record, os.Getuid(), userpkg.LookupId)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if identity.UID != os.Getuid() {
++		t.Fatalf("elevated identity UID = %d, want record owner %d", identity.UID, os.Getuid())
++	}
++	forged := record
++	forged.UID = 501
++	if _, err := validateIdentityRecord(forged, os.Getuid(), userpkg.LookupId); err == nil {
++		t.Fatal("record claiming another UID was accepted")
++	}
++}
++
++func TestInvocationIdentityFileIsPrivateAndOwnerBound(t *testing.T) {
++	if os.Getuid() == 0 {
++		t.Skip("requires an unprivileged test user")
++	}
++	path, cleanup, err := createInvocationIdentityFile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer cleanup()
++	fileInfo, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	dirInfo, err := os.Stat(filepath.Dir(path))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if fileInfo.Mode().Perm() != 0o600 || dirInfo.Mode().Perm() != 0o700 {
++		t.Fatalf("identity record mode = %o/%o, want 600/700", fileInfo.Mode().Perm(), dirInfo.Mode().Perm())
++	}
++	identity, err := readInvocationIdentity(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if identity.UID != os.Getuid() {
++		t.Fatalf("identity UID = %d, want %d", identity.UID, os.Getuid())
++	}
++}
++
++func TestProcessIdentityRejectsPIDReuseAndPathChange(t *testing.T) {
++	before := wechatProcess{PID: 42, UID: 502, RUID: 502, Path: expectedWechatExecutable("/Users/fixture-user/shadow.app"), Start: "start-a"}
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	if err := validateProcessForSignal(before, before, identity, "/Users/fixture-user/shadow.app"); err != nil {
++		t.Fatalf("same process should be signalable: %v", err)
++	}
++	changedStart := before
++	changedStart.Start = "start-b"
++	if err := validateProcessForSignal(before, changedStart, identity, "/Users/fixture-user/shadow.app"); err == nil {
++		t.Fatal("PID reuse was accepted")
++	}
++	changedPath := before
++	changedPath.Path = expectedWechatExecutable("/Applications/WeChat.app")
++	if err := validateProcessForSignal(before, changedPath, identity, "/Users/fixture-user/shadow.app"); err == nil {
++		t.Fatal("executable path change was accepted")
++	}
++}
++
++func TestScopeWechatProcessesRejectsMultipleSameUserInstances(t *testing.T) {
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	original := "/Applications/WeChat.app"
++	shadow := filepath.Join(identity.Home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	processes := []wechatProcess{
++		{PID: 20, UID: 502, RUID: 502, Path: expectedWechatExecutable(original), Start: "start-a"},
++		{PID: 21, UID: 502, RUID: 502, Path: expectedWechatExecutable(shadow), Start: "start-b"},
++	}
++	if _, err := scopeWechatProcesses(processes, identity, original, shadow); err == nil {
++		t.Fatal("multiple same-user WeChat instances were accepted")
++	}
++}
++
++func TestScopeWechatProcessesRejectsAmbiguousUIDAndExecutable(t *testing.T) {
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	original := "/Applications/WeChat.app"
++	shadow := filepath.Join(identity.Home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	for name, process := range map[string]wechatProcess{
++		"mismatched real UID": {PID: 20, UID: 502, RUID: 501, Path: expectedWechatExecutable(original), Start: "start"},
++		"unknown executable":  {PID: 21, UID: 502, RUID: 502, Path: "/tmp/WeChat", Start: "start"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := scopeWechatProcesses([]wechatProcess{process}, identity, original, shadow); err == nil {
++				t.Fatal("ambiguous process identity was accepted")
++			}
++		})
++	}
++}
++
++func TestFailedShadowRecoveryCanSelectOnlyOwnShadow(t *testing.T) {
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	original := "/Applications/WeChat.app"
++	shadow := filepath.Join(identity.Home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	workaShadow := wechatProcess{PID: 20, UID: 502, RUID: 502, Path: expectedWechatExecutable(shadow), Start: "fixture-user-start"}
++	realizerOriginal := wechatProcess{PID: 10, UID: 501, RUID: 501, Path: expectedWechatExecutable(original), Start: "other-user-start"}
++
++	selected, err := scopeWechatProcesses([]wechatProcess{realizerOriginal, workaShadow}, identity, original, shadow)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(selected) != 1 || selected[0].PID != workaShadow.PID {
++		t.Fatalf("recovery candidates = %#v, want only worka shadow", selected)
++	}
++	if err := validateProcessForSignal(workaShadow, realizerOriginal, identity, shadow); err == nil {
++		t.Fatal("failed shadow recovery could target realizer's process")
++	}
++	if err := validateProcessForSignal(workaShadow, workaShadow, identity, shadow); err != nil {
++		t.Fatalf("own shadow should remain the only valid recovery target: %v", err)
++	}
++}
++
++func TestForeignProcessAtOwnShadowPathBlocksReplacement(t *testing.T) {
++	identity := invocationIdentity{UID: 502, Username: "fixture-user", Home: "/Users/fixture-user"}
++	original := "/Applications/WeChat.app"
++	shadow := filepath.Join(identity.Home, "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	foreign := wechatProcess{PID: 10, UID: 501, RUID: 501, Path: expectedWechatExecutable(shadow), Start: "foreign-start"}
++	if _, err := scopeWechatProcesses([]wechatProcess{foreign}, identity, original, shadow); err == nil {
++		t.Fatal("foreign process using the user's shadow path must block replacement")
++	}
++}
++
++func TestWechatProcessCleanupRefusesForceKill(t *testing.T) {
++	if err := terminateWechatProcessesUnderApp("/tmp/WeChat.app", syscall.SIGKILL); err == nil {
++		t.Fatal("force-kill cleanup was accepted")
++	}
++}
++
++func TestOperationConfigOwnsShadowAndElevationIdentity(t *testing.T) {
++	home := t.TempDir()
++	t.Setenv("WXKEY_ORIG_HOME", home)
++	previous := commandConfigPath
++	t.Cleanup(func() { commandConfigPath = previous })
++	config := filepath.Join(home, "providers", ".wxkey-bootstrap", "operation", "key_config.json")
++	f := parseFlags([]string{"--config", config})
++	shadow := filepath.Join(filepath.Dir(config), "Library", "Application Support", "wx-mcp", "WeChat-shadow.app")
++	t.Setenv("WXKEY_SHADOW_WECHAT_APP", filepath.Join(home, "unrelated.app"))
++	if f.config != config || shadowWeChatPath() != shadow || effectiveUserHome() != home {
++		t.Fatal("config-owned shadow changed the invoking home or accepted an unrelated shadow override")
++	}
++	if _, _, _, err := validateShadowWeChatPath(shadow); err != nil {
++		t.Fatalf("operation shadow rejected: %v", err)
++	}
++	if got, err := validateConfigPathForWrite(config, true); err != nil || got != config {
++		t.Fatalf("selected elevated config rejected: %q/%v", got, err)
++	}
++	if _, err := validateConfigPathForWrite(filepath.Join(home, "other.json"), true); err == nil {
++		t.Fatal("elevated command accepted a different config")
++	}
++	path, cleanup, err := createInvocationIdentityFile()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer cleanup()
++	identity, err := readInvocationIdentity(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if identity.ConfigPath != config || identity.Home != home || identity.UID != os.Getuid() {
++		t.Fatal("elevation record did not retain the same config and invoking identity")
++	}
++}
++
++func TestInvocationConfigRejectsEscapeAndSymlink(t *testing.T) {
++	home := t.TempDir()
++	outside := t.TempDir()
++	for _, path := range []string{"relative.json", filepath.Join(outside, "config.json"), home} {
++		if _, err := validateInvocationConfig(path, home); err == nil {
++			t.Fatalf("unsafe config accepted: %s", path)
++		}
++	}
++	if err := os.Symlink(outside, filepath.Join(home, "linked")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := validateInvocationConfig(filepath.Join(home, "linked", "config.json"), home); err == nil {
++		t.Fatal("symlink config parent accepted")
++	}
++	target := filepath.Join(home, "target.json")
++	if err := os.WriteFile(target, []byte("sentinel"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	linked := filepath.Join(home, "linked.json")
++	if err := os.Symlink(target, linked); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := validateInvocationConfig(linked, home); err == nil {
++		t.Fatal("symlink config accepted")
++	}
++}
