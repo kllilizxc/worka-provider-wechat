@@ -1,0 +1,4 @@
+*.patch -whitespace
+
+# Worka publication: preserve the bytes verified by worka-prebuilt/manifest.json.
+* -text -filter -ident -working-tree-encoding -export-subst -export-ignore

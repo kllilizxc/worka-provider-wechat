@@ -1,0 +1,12 @@
+{
+  "go": {
+    "version": "1.26.5",
+    "archive": "https://go.dev/dl/go1.26.5.darwin-arm64.tar.gz",
+    "sha256": "efb87ff28af9a188d0536ef5d42e63dd52ba8263cd7344a993cc48dd11dedb6a",
+    "binarySha256": "3925fc3221ac440ebf7c35361ff663bed0c7bdb2e0a157b75fe993607ffe0a19"
+  },
+  "swift": {
+    "version": "6.2.4",
+    "target": "arm64-apple-macosx15.0"
+  }
+}

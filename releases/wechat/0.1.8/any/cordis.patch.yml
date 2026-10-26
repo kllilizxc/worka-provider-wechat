@@ -1,0 +1,3 @@
+- insert:
+    - id: worka-wechat
+      name: '@realiz3r/worka-provider-wechat'
