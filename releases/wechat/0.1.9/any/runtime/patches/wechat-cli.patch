@@ -1,0 +1,347 @@
+--- a/cmd/wechat-cli/agent.go
++++ b/cmd/wechat-cli/agent.go
+@@ -70,6 +70,7 @@
+ 		strings.HasPrefix(s, "wxid_") ||
+ 		strings.HasPrefix(s, "gh_") ||
+ 		strings.HasPrefix(s, "biz_") ||
++		s == "filehelper" ||
+ 		s == "brandsessionholder" ||
+ 		s == "brandservicesessionholder"
+ }
+--- a/cmd/wechat-cli/read_os.go
++++ b/cmd/wechat-cli/read_os.go
+@@ -118,10 +118,13 @@
+ 				cache["index_path"] = paths.IndexPath
+ 			}
+ 			if cfg.DBRoot != "" {
+-				if dbs, err := listSourceDBs(cfg, paths); err == nil {
+-					cache["source_db_count"] = len(dbs)
++				// A readiness check must not open every unselected source directory.
++				if includeDebug {
++					if dbs, err := listSourceDBs(cfg, paths); err == nil {
++						cache["source_db_count"] = len(dbs)
++					}
+ 				}
+-				if wcdbPath, err := findWCDB(); err == nil {
++				if wcdbPath, err := findWCDB(); includeDebug && err == nil {
+ 					if err := wcdb.Bootstrap(wcdbPath); err == nil {
+ 						if fresh, reason, err := s.cacheFreshness(cfg, paths); err == nil && !fresh && reason != "" {
+ 							cache["metadata_stale_reason"] = metadataStatusReason(reason)
+--- /dev/null
++++ b/cmd/wechat-cli/status_readiness_local_test.go
+@@ -0,0 +1,42 @@
++//go:build darwin || linux
++
++package main
++
++import (
++	"context"
++	"github.com/r266-tech/wechat-cli/internal/config"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestDefaultStatusDoesNotScanUnselectedDatabases(t *testing.T) {
++	if os.Getenv("WORKA_STATUS_TEST_CHILD") == "1" {
++		s := &server{cfg: &config.Config{Wxid: "synthetic", DBRoot: os.Getenv("WORKA_STATUS_TEST_ROOT"), Keys: map[string]string{"synthetic": "key"}}}
++		result := s.readOSStatus(false)
++		cache, _ := result["metadata_cache"].(map[string]any)
++		if _, present := cache["source_db_count"]; present {
++			t.Fatal("ordinary readiness must not inventory source files")
++		}
++		return
++	}
++	dir := t.TempDir()
++	storage := filepath.Join(dir, "db_storage", "unselected")
++	if err := os.MkdirAll(storage, 0700); err != nil {
++		t.Fatal(err)
++	}
++	// A source unavailable for reading must not block unrelated readiness checks.
++	if err := syscall.Mkfifo(filepath.Join(storage, "unavailable.db"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDefaultStatusDoesNotScanUnselectedDatabases$")
++	cmd.Env = append(os.Environ(), "WORKA_STATUS_TEST_CHILD=1", "WORKA_STATUS_TEST_ROOT="+dir, "WECHAT_CLI_CONFIG="+filepath.Join(dir, "config.json"), "WECHAT_CLI_STATE_DIR="+filepath.Join(dir, "state"), "WECHAT_CLI_WCDB_LIB="+filepath.Join(dir, "missing.dylib"))
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("ordinary readiness blocked on an unselected source: %v %s", err, out)
++	}
++}
+--- /dev/null
++++ b/cmd/wechat-cli/filehelper_resolution_test.go
+@@ -0,0 +1,17 @@
++package main
++
++import "testing"
++
++func TestFileHelperResolvesWithoutMetadataCache(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	s := &server{}
++	for _, key := range []string{"talker", "chat"} {
++		got, err := s.resolveLooseChatArg(map[string]any{key: "filehelper"})
++		if err != nil || got != "filehelper" {
++			t.Fatalf("%s: got %q, %v", key, got, err)
++		}
++	}
++	if looksLikeRawChatID("文件传输助手") {
++		t.Fatal("display name must still use metadata resolution")
++	}
++}
+--- /dev/null
++++ b/cmd/wechat-cli/empty_history_test.go
+@@ -0,0 +1,142 @@
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"reflect"
++	"testing"
++
++	"github.com/r266-tech/wechat-cli/internal/wcdb"
++)
++
++func TestMessageShardLookupEmptyAndFailures(t *testing.T) {
++	const tableName = "Msg_synthetic_empty_history"
++
++	t.Run("table absent after all available shards were checked", func(t *testing.T) {
++		for _, shardCount := range []int{1, 3} {
++			found, err := finishMessageShardLookup(tableName, shardCount, nil, nil)
++			if !errors.Is(err, errMessageTableAbsent) {
++				t.Fatalf("%d checked shards: error = %v, want errMessageTableAbsent", shardCount, err)
++			}
++			if len(found) != 0 {
++				t.Fatalf("absent table returned %d shards", len(found))
++			}
++		}
++	})
++
++	t.Run("no shards is not evidence of an empty chat", func(t *testing.T) {
++		found, err := finishMessageShardLookup(tableName, 0, nil, nil)
++		if err == nil || errors.Is(err, errMessageTableAbsent) {
++			t.Fatalf("no shards: error = %v, want a non-empty non-sentinel error", err)
++		}
++		if len(found) != 0 {
++			t.Fatalf("no shards returned %d results", len(found))
++		}
++	})
++
++	failureKinds := []string{"missing key", "open failure", "schema query failure"}
++	for _, failureKind := range failureKinds {
++		for _, partialFound := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/partial_found=%t", failureKind, partialFound), func(t *testing.T) {
++				cause := errors.New("synthetic " + failureKind)
++				var input []msgShardDB
++				if partialFound {
++					// These inert handles exercise the cleanup path without opening
++					// a database or loading the native database library.
++					input = []msgShardDB{
++						{Name: "message_0.db", DB: &wcdb.DB{}},
++						{Name: "message_1.db", DB: nil},
++					}
++				}
++				found, err := finishMessageShardLookup(tableName, 3, input, []error{
++					fmt.Errorf("message_2.db: %w", cause),
++				})
++				if err == nil || errors.Is(err, errMessageTableAbsent) {
++					t.Fatalf("failed shard was treated as an empty or complete result: error = %v", err)
++				}
++				if !errors.Is(err, cause) {
++					t.Fatalf("underlying shard failure was lost: error = %v", err)
++				}
++				if found != nil {
++					t.Fatalf("failed lookup returned a non-nil partial result: %#v", found)
++				}
++			})
++		}
++	}
++
++	t.Run("multiple failures preserve the first cause and reject partial results", func(t *testing.T) {
++		first := errors.New("synthetic missing key")
++		second := errors.New("synthetic schema query failure")
++		found, err := finishMessageShardLookup(tableName, 3, []msgShardDB{
++			{Name: "message_2.db", DB: &wcdb.DB{}},
++		}, []error{
++			fmt.Errorf("message_0.db: %w", first),
++			fmt.Errorf("message_1.db: %w", second),
++		})
++		if !errors.Is(err, first) || errors.Is(err, errMessageTableAbsent) {
++			t.Fatalf("lookup error did not preserve the first failure as a non-sentinel error: %v", err)
++		}
++		if found != nil {
++			t.Fatalf("failed lookup returned a non-nil partial result: %#v", found)
++		}
++	})
++
++	t.Run("fully checked successful result is preserved", func(t *testing.T) {
++		input := []msgShardDB{
++			{Name: "message_0.db", DB: &wcdb.DB{}, Warnings: []string{"synthetic warning"}},
++			{Name: "message_2.db", DB: &wcdb.DB{}},
++		}
++		found, err := finishMessageShardLookup(tableName, 3, input, nil)
++		if err != nil {
++			t.Fatalf("complete successful lookup failed: %v", err)
++		}
++		if !reflect.DeepEqual(found, input) {
++			t.Fatalf("successful lookup changed shard metadata: got %#v, want %#v", found, input)
++		}
++		for i := range found {
++			if found[i].DB != input[i].DB {
++				t.Fatalf("successful lookup replaced database handle %d", i)
++			}
++		}
++	})
++}
++
++func TestEmptyTimelineRetainsMessagesArray(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		messages []map[string]any
++	}{
++		{name: "nil messages", messages: nil},
++		{name: "empty messages", messages: []map[string]any{}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			env := messageTimelineEnvelope(
++				map[string]any{"chat": "synthetic chat"}, nil, tc.messages,
++				messagePageInfo{Limit: 25}, "sort_seq DESC, local_id DESC", "asc",
++			)
++			messages, ok := env["messages"].([]map[string]any)
++			if !ok || messages == nil || len(messages) != 0 {
++				t.Fatalf("messages = %#v, want a present non-nil empty message slice", env["messages"])
++			}
++			query, ok := env["query"].(map[string]any)
++			if !ok || query["returned"] != 0 || query["has_more"] != false || query["limit"] != 25 {
++				t.Fatalf("empty timeline lost its standard pagination metadata: %#v", env["query"])
++			}
++			if freshness, ok := env["freshness"].(map[string]any); !ok || len(freshness) == 0 {
++				t.Fatalf("empty timeline lost freshness metadata: %#v", env["freshness"])
++			}
++			encoded, err := json.Marshal(env)
++			if err != nil {
++				t.Fatalf("encode timeline: %v", err)
++			}
++			var fields map[string]json.RawMessage
++			if err := json.Unmarshal(encoded, &fields); err != nil {
++				t.Fatalf("decode timeline JSON: %v", err)
++			}
++			if string(fields["messages"]) != "[]" {
++				t.Fatalf("messages JSON = %s, want []", fields["messages"])
++			}
++		})
++	}
++}
+--- a/cmd/wechat-cli/main.go
++++ b/cmd/wechat-cli/main.go
+@@ -473,16 +473,27 @@
+ 		}
+ 		db.Close()
+ 	}
++	return finishMessageShardLookup(tableName, len(shards), found, openErrs)
++}
++
++var errMessageTableAbsent = errors.New("message table is absent from all readable shards")
++
++func finishMessageShardLookup(tableName string, shardCount int, found []msgShardDB, openErrs []error) ([]msgShardDB, error) {
++	// Missing keys, failed opens and schema-query failures are not empty history,
++	// even if another shard happens to contain this conversation's table.
++	if len(openErrs) > 0 {
++		closeMsgDBs(found)
++		return nil, fmt.Errorf("message shard lookup failed: %d/%d shards unchecked: %w", len(openErrs), shardCount, openErrs[0])
++	}
+ 	if len(found) > 0 {
+-		if len(openErrs) > 0 {
+-			found[0].Warnings = []string{fmt.Sprintf("message_shard_coverage_partial:%d_of_%d_unchecked", len(openErrs), len(shards))}
+-		}
+ 		return found, nil
+ 	}
+-	if len(openErrs) > 0 {
+-		return nil, fmt.Errorf("table %s not found in opened message shards; %d/%d shards could not be opened, first error: %v", tableName, len(openErrs), len(shards), openErrs[0])
+-	}
+-	return nil, fmt.Errorf("table %s not found in %d message shards", tableName, len(shards))
++	if shardCount == 0 {
++		return nil, fmt.Errorf("no message shards are available")
++	}
++	// Every real shard was successfully opened and its schema checked. A chat
++	// without a local table (including unused filehelper) has no local history.
++	return nil, errMessageTableAbsent
+ }
+ 
+ func closeMsgDBs(shards []msgShardDB) {
+@@ -821,12 +832,16 @@
+ }
+ 
+ func messageTimelineEnvelope(args map[string]any, rows []wcdb.Row, messages []map[string]any, page messagePageInfo, queryOrder, displayOrder string) map[string]any {
+-	return compactMap(map[string]any{
++	out := compactMap(map[string]any{
+ 		"query":     chatTimelineQueryMeta(args, rows, page, queryOrder, displayOrder, len(messages)),
+ 		"freshness": chatTimelineFreshnessMeta(args, rows, page),
+ 		"warnings":  page.Warnings,
+-		"messages":  messages,
+ 	})
++	if messages == nil {
++		messages = []map[string]any{}
++	}
++	out["messages"] = messages
++	return out
+ }
+ 
+ func chatTimelineQueryMeta(args map[string]any, rows []wcdb.Row, page messagePageInfo, queryOrder, displayOrder string, returned int) map[string]any {
+@@ -1050,7 +1065,7 @@
+ 	}
+ 	tableName := "Msg_" + talkerHash(talker)
+ 	shards, err := s.findMsgDBs(tableName)
+-	if err != nil {
++	if err != nil && !errors.Is(err, errMessageTableAbsent) {
+ 		return nil, messagePageInfo{}, err
+ 	}
+ 	defer closeMsgDBs(shards)
+@@ -5842,7 +5857,13 @@
+ }
+ 
+ func (s *server) resolveLooseChatArg(a map[string]any) (string, error) {
+-	raw := strings.TrimSpace(firstNonEmpty(getStr(a, "talker"), getStr(a, "chat")))
++	// The sessions API returns opaque IDs. An explicit talker is already an
++	// ID, including legacy usernames without a wxid_ prefix; only chat may
++	// request display-name resolution through metadata.
++	if talker := strings.TrimSpace(getStr(a, "talker")); talker != "" {
++		return talker, nil
++	}
++	raw := strings.TrimSpace(getStr(a, "chat"))
+ 	if raw == "" || looksLikeRawChatID(raw) {
+ 		return raw, nil
+ 	}
+--- /dev/null
++++ b/cmd/wechat-cli/explicit_talker_test.go
+@@ -0,0 +1,25 @@
++package main
++
++import (
++	"path/filepath"
++	"testing"
++)
++
++func TestExplicitTalkerDoesNotRequireMetadataCache(t *testing.T) {
++	root := t.TempDir()
++	t.Setenv("WECHAT_CLI_CONFIG", filepath.Join(root, "missing-config.json"))
++	t.Setenv("WECHAT_CLI_STATE_DIR", filepath.Join(root, "missing-metadata"))
++	t.Setenv("WECHAT_CLI_DISABLE_AUTO_REFRESH", "1")
++	s := &server{}
++	for _, talker := range []string{"legacy_contact", "name.with-dash", "wxid_synthetic", "123@chatroom", "filehelper"} {
++		t.Run(talker, func(t *testing.T) {
++			got, err := s.resolveLooseChatArg(map[string]any{"talker": talker, "chat": "Display Name Must Not Be Resolved"})
++			if err != nil || got != talker {
++				t.Fatalf("explicit opaque ID was not preserved: got %q, error %v", got, err)
++			}
++		})
++	}
++	if _, err := s.resolveLooseChatArg(map[string]any{"talker": " ", "chat": "Display Name Requires Metadata"}); err == nil {
++		t.Fatal("display-name lookup failure was silently treated as an ID or empty history")
++	}
++}
