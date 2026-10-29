@@ -20,6 +20,7 @@ export type CachedChat = {
 export type Notice = {
     chatId: string;
     title: string;
+    fromMessageId: string | null;
     messageId: string;
     revision: string;
 };
@@ -27,8 +28,6 @@ export type Consumer = {
     accountId: string;
     enabled: boolean;
     chats: Chat[];
-    eventsEnabled: boolean;
-    eventsSince: number;
     pending: Record<string, Notice>;
 };
 export type Account = {

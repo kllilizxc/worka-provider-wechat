@@ -12,7 +12,6 @@
       "extension.worka-wechat.chats",
       "extension.worka-wechat.messages",
       "extension.worka-wechat.sessions",
-      "extension.worka-wechat.events",
       "extension.worka-wechat.snapshots"
     ]
   },

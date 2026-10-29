@@ -10,12 +10,12 @@
     ".gitattributes": "d6504560a89539dfc9e0a7d9d0b37e48d526efd4b5d52f12d836704ba5545256",
     "LICENSE": "3cd5a7b5de3c6f613966844f184149fb859ff4fe216109e732a2cc7489829d19",
     "NOTICE": "1b0d72ba748fd448edfc578a76b7a503228d70db5824d958caa5dd44adb7b461",
-    "README.md": "15d41c9f02730e6af28aeb5dfb69145ee40c33744e09c91a5687a3ecf493fca2",
+    "README.md": "33a787efab8c9019e40d5d43ac75c3e74875eeae514e4addfa092fe569bafa19",
     "bridge/mcp_bridge.py": "fd5d041130e03d3e0c0e44fa645eeb24e0aa55b78d8a00336551183db66b2b3a",
     "cordis.patch.yml": "925a58b74b6730c523e96031604d774f24e3b4fb8fef2ca006305d8da57a64a1",
     "index.d.ts": "d6abc50248444afd13d875d664b46460850999a36cab58ba3dcee6ad65fc7f6f",
-    "index.js": "59a8b592116b8805948e5f8d22e42a21726f0f732a101b81db694480a1e93503",
-    "package.json": "884d1af303cc361d109f7061892b3913673ff288c1906a1f16be7d1a0ea53184",
+    "index.js": "95717992c652d911bef401b2a86fe4f065b6fee009441f48155fc2d5aa9b8954",
+    "package.json": "d3dddad1b8085a16883e83205cd560d5128a54c8c08863bd56d22f382014bce1",
     "runtime/build-toolchains.json": "f29f0756970b1d8504ed0cfab0ee0b57cfcad590c78de0a1de976446b226d220",
     "runtime/build.mjs": "75b7ecc987ed3645990775326e997acaf210ff4a78e62a1ff5891f9e150555c1",
     "runtime/bundle.mjs": "e53c23a7c94057379468058d995388a036d520af8bd53c9a717afae53b829c40",
@@ -32,8 +32,8 @@
     "runtime/verify-release.mjs": "5c8ef975e3b115c1da767c9832c977e60623c69be5ea4894a060609d2e963d38",
     "runtime/wechat-runtime-darwin-arm64.tar.gz": "1a2603a20dff72b40bc8a8f210c61fcc882b28c312293c58e9df3a7174674368",
     "source.d.ts": "442e7e35c14721cdc0e7c1b52a4f3e3275fdb8071024c7f532b8f3ce2f2b29dc",
-    "state.d.ts": "e91b92ab7d968b6efaa35b65734b52b1f90f50cd6515809e1f6415145ea90539"
+    "state.d.ts": "41497296cfe8d47d63e5853ebc9c2e4400c859bc4683a4b0b9a4e0bbdf6c57f9"
   },
   "dataVersion": 1,
-  "integrity": "sha256-bad8176ff7e4ff21a27c409984ce730292b257a1539cf3daf1e67e5ce573f89c"
+  "integrity": "sha256-1279bbc64a6a4fe0b7803b7ad2747f8a7085e967c7237f2fb9495cdc39c1df31"
 }

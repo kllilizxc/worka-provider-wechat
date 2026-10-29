@@ -35,14 +35,13 @@ These are ordinary extension methods called through Worka with the host-derived 
 | `select({ chats })` | Save this consumer's selected `{ id, name, type }` chats. Other consumers remain unchanged. |
 | `read({ chatId })` / `refresh()` | Read selected messages with shared cursor/cache updates. Failed reads retain the previous cursor. |
 | `enable({ enabled })` | Enable or disable this note's ongoing synchronization. |
-| `events({ enabled })` | Compatibility operation for older notes; selected chats always emit changes. |
 | `disconnect()` | Remove this note's subscription while preserving the account, runtime, keys, and other notes. |
 
-Resources are `setup`, `connection`, `status`, `chats`, `messages`, `sessions`, and `events`, all under `extension.worka-wechat`. `setup` is a read-only resource name, not a lifecycle callback. `messages` takes `{ chatId }` and returns `{ chat, messages, updatedAt }`; its normal resource refresh performs ingestion separately from its read-only projection. `chats` returns this note's selected chats with cached counts/latest messages. `sessions` returns a page of `{ id, name, type }` items.
+Resources are `setup`, `connection`, `status`, `chats`, `messages`, and `sessions`, all under `extension.worka-wechat`. `setup` is a read-only resource name, not a lifecycle callback. `messages` takes `{ chatId }` and returns `{ chat, messages, updatedAt }`; its normal resource refresh performs ingestion separately from its read-only projection. `chats` returns this note's selected chats with cached counts/latest messages. `sessions` returns a page of `{ id, name, type }` items.
 
 A note that requires this connection declares `prerequisites: [{ name: "extension.worka-wechat.status" }]` in `worka-note.json`. `ready` becomes true only after that authorized note joins following a real business read. The verification is tied to the local configuration fingerprint and persists across restart. A later transient read failure keeps that completed onboarding, exposes its `issue`, and sets `connected: false`; it does not force the user through onboarding again. An account/configuration change, missing executable/key configuration, or lack of note authorization keeps `ready: false`.
 
-Each selected chat can produce an `items.changed` event with `itemId`, `chatId`, `title`, `messageId`, and `revision`. The notification identifies a changed source item; it does not ask an Agent to act on its own. Several changes awaiting delivery for one chat coalesce to its latest revision. A note decides which messages need business processing and maintains its own processing checkpoint and feedback. Host event keys make retried deliveries idempotent.
+Each selected chat can produce an `items.changed` event with `itemId`, `chatId`, `title`, `fromMessageId`, `messageId`, and `revision`. The notification identifies a changed source item; it does not ask an Agent to act on its own. The committed batch is after `fromMessageId` and through `messageId` (inclusive); a null start means there was no earlier message; older cache entries are context only. An unacknowledged batch is retried before ingesting the next one. A note decides which messages need business processing and maintains its own processing checkpoint and feedback. Host event keys make retried deliveries idempotent.
 
 ## First-use key preparation
 
