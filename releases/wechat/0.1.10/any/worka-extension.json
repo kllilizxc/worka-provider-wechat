@@ -14,7 +14,7 @@
     "bridge/mcp_bridge.py": "fd5d041130e03d3e0c0e44fa645eeb24e0aa55b78d8a00336551183db66b2b3a",
     "cordis.patch.yml": "925a58b74b6730c523e96031604d774f24e3b4fb8fef2ca006305d8da57a64a1",
     "index.d.ts": "d6abc50248444afd13d875d664b46460850999a36cab58ba3dcee6ad65fc7f6f",
-    "index.js": "5728379a6ecc421edf3a480d27c8b89b50e011adec4dbd705af9252185b5e2dd",
+    "index.js": "59a8b592116b8805948e5f8d22e42a21726f0f732a101b81db694480a1e93503",
     "package.json": "884d1af303cc361d109f7061892b3913673ff288c1906a1f16be7d1a0ea53184",
     "runtime/build-toolchains.json": "f29f0756970b1d8504ed0cfab0ee0b57cfcad590c78de0a1de976446b226d220",
     "runtime/build.mjs": "75b7ecc987ed3645990775326e997acaf210ff4a78e62a1ff5891f9e150555c1",
@@ -35,5 +35,5 @@
     "state.d.ts": "e91b92ab7d968b6efaa35b65734b52b1f90f50cd6515809e1f6415145ea90539"
   },
   "dataVersion": 1,
-  "integrity": "sha256-11c0a984778f15fe1a9c809ed5e83698f2a6e2b5c4d3d6632a6352b04a476fef"
+  "integrity": "sha256-bad8176ff7e4ff21a27c409984ce730292b257a1539cf3daf1e67e5ce573f89c"
 }
