@@ -1,0 +1,30 @@
+Worka WeChat provider
+Copyright (c) 2026 Worka contributors
+
+The provider, local bridge and runtime installation helpers in this package are
+distributed under the accompanying MIT LICENSE.
+
+The source checkout contains runtime source metadata but not the third-party
+runtime archive. A provider release includes the adjacent archive named by
+runtime/release.json. runtime/sources.json records the precise versions, source
+locations and hashes for its pinned inputs:
+
+- wechat-local-agent-mcp, maintained by hetiankong
+- wechat-cli and wxkey, maintained by R266 Tech
+- Tencent's SQLCipher fork
+- CPython via Astral's python-build-standalone distribution
+
+The runtime artifact has its own third-party licenses and file receipt. Preserve
+those notices when distributing that artifact; this notice does not replace
+upstream license texts. The runtime build also includes its Go runtime and Python
+dependencies, whose notices belong with that artifact. The release build checks
+the archive's pinned SHA-256; installation independently checks the archive and
+its file receipt.
+
+An official public release URL is recorded in runtime/release.json only when an
+asset has been published. Provider and Worka release builds verify a local
+runtime cache before fetching a published, exact pinned URL, then copy the
+archive beside the provider. A local build uses runtime/build.mjs and the
+hash-pinned inputs, patches and toolchains documented with the receipt; it does
+not invent a download URL. Explicit deployment overrides remain available.
+Recording wxkey as runtime provenance does not invoke key extraction.

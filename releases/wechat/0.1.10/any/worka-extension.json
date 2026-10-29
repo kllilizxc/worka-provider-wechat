@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "packageName": "@realiz3r/worka-provider-wechat",
+  "version": "0.1.10",
+  "entry": "index.js",
+  "capabilities": [
+    "worka-wechat"
+  ],
+  "files": {
+    ".gitattributes": "d6504560a89539dfc9e0a7d9d0b37e48d526efd4b5d52f12d836704ba5545256",
+    "LICENSE": "3cd5a7b5de3c6f613966844f184149fb859ff4fe216109e732a2cc7489829d19",
+    "NOTICE": "1b0d72ba748fd448edfc578a76b7a503228d70db5824d958caa5dd44adb7b461",
+    "README.md": "33a787efab8c9019e40d5d43ac75c3e74875eeae514e4addfa092fe569bafa19",
+    "bridge/mcp_bridge.py": "fd5d041130e03d3e0c0e44fa645eeb24e0aa55b78d8a00336551183db66b2b3a",
+    "cordis.patch.yml": "925a58b74b6730c523e96031604d774f24e3b4fb8fef2ca006305d8da57a64a1",
+    "index.d.ts": "d6abc50248444afd13d875d664b46460850999a36cab58ba3dcee6ad65fc7f6f",
+    "index.js": "95717992c652d911bef401b2a86fe4f065b6fee009441f48155fc2d5aa9b8954",
+    "package.json": "d3dddad1b8085a16883e83205cd560d5128a54c8c08863bd56d22f382014bce1",
+    "runtime/build-toolchains.json": "f29f0756970b1d8504ed0cfab0ee0b57cfcad590c78de0a1de976446b226d220",
+    "runtime/build.mjs": "75b7ecc987ed3645990775326e997acaf210ff4a78e62a1ff5891f9e150555c1",
+    "runtime/bundle.mjs": "e53c23a7c94057379468058d995388a036d520af8bd53c9a717afae53b829c40",
+    "runtime/install.mjs": "fc558cc3850ec010c913f4d61593542dfaca812aae2ec3e08f0cb73434325ef5",
+    "runtime/patches/.gitattributes": "ea6fa6d839d89cc491133525e8917a296e0f8880b4b7c155bf8288c1b9a277b8",
+    "runtime/patches/wechat-cli.patch": "200959c54c327f60c6a5595d6ea3bb243c02556f27b205e810f230e0484e2728",
+    "runtime/patches/wxkey-readonly-shadow.patch": "fc226d412b800d71d8b31203445cfb6a8f65579059cce2365c553c3877d8995c",
+    "runtime/patches/wxkey-user-isolation.patch": "8c261059ead2b68ac89e43bdff783cfe61304e8e248cd9e81d56bde3c087672f",
+    "runtime/patches/wxkey.patch": "5a8b9dcb2455270ca4093000f708c06e8cec57cc668c1954951ba7e1a469257f",
+    "runtime/release.json": "64d45974cb3eb33a43aa7dc9d0f1c5238e3d77eaf908ff05319e47b4675b4fca",
+    "runtime/requirements.txt": "8ee1c2e812313362059f2a68a0c13f6e8f9ae544f05195a5ea624dcbaf948bc6",
+    "runtime/sources.json": "47816d9716e0d918b5cf2dccd92c217e8878116047276a9f8f78f5276d32c0d7",
+    "runtime/verify-release.d.mts": "44d5424b14350f6b7d30a380c1a36825097f1e3deba90f7f356d867dd5b3bcd8",
+    "runtime/verify-release.mjs": "5c8ef975e3b115c1da767c9832c977e60623c69be5ea4894a060609d2e963d38",
+    "runtime/wechat-runtime-darwin-arm64.tar.gz": "1a2603a20dff72b40bc8a8f210c61fcc882b28c312293c58e9df3a7174674368",
+    "source.d.ts": "442e7e35c14721cdc0e7c1b52a4f3e3275fdb8071024c7f532b8f3ce2f2b29dc",
+    "state.d.ts": "41497296cfe8d47d63e5853ebc9c2e4400c859bc4683a4b0b9a4e0bbdf6c57f9"
+  },
+  "dataVersion": 1,
+  "integrity": "sha256-1279bbc64a6a4fe0b7803b7ad2747f8a7085e967c7237f2fb9495cdc39c1df31"
+}

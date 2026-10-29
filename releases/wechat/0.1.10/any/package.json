@@ -1,0 +1,51 @@
+{
+  "name": "@realiz3r/worka-provider-wechat",
+  "version": "0.1.10",
+  "private": true,
+  "worka": {
+    "dataVersion": 1,
+    "resourceManifestVersion": 1,
+    "resources": [
+      "extension.worka-wechat.setup",
+      "extension.worka-wechat.connection",
+      "extension.worka-wechat.status",
+      "extension.worka-wechat.chats",
+      "extension.worka-wechat.messages",
+      "extension.worka-wechat.sessions",
+      "extension.worka-wechat.snapshots"
+    ]
+  },
+  "type": "module",
+  "description": "Shared local read-only WeChat provider for Worka",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "*.d.ts",
+    "runtime",
+    "bridge",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "cordis.patch.yml"
+  ],
+  "peerDependencies": {
+    "@realiz3r/worka": ">=0.3.24 <0.4.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "main": "./index.js",
+  "types": "./index.d.ts"
+}
